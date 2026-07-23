@@ -273,25 +273,22 @@ async def execute_full_pipeline(
 
 # --- 6. Pipeline Step Worker Functions ---
 
-# --- A. Preprocessing (UPDATED FIX) ---
+# --- A. Preprocessing (UPDATED FIXED VERSION) ---
 async def preprocess_uploaded_file(job: PipelineJob, file_contents: bytes, filename: str) -> List[str]:
     """
     Reads CSV/Excel bytes into Pandas, specifically looking for company name columns.
     """
     logger.info(f"Job {job.id}: Starting preprocessing.")
-    # (Removed: await file_upload.read() - We already have the bytes)
 
     try:
-        # Load file contents into Pandas (using the bytes object directly)
+        # 1. Load file contents (Encoding fallback is crucial for Land Reg CSVs)
         if filename.lower().endswith('.csv'):
-            # Convert bytes to string stream for CSV parser
-            # Need to specify encoding if it's not standard UTF-8 (e.g., Land Reg CSV might be ISO-8859-1)
             try:
-                # Try standard UTF-8
+                # Attempt standard UTF-8
                 content_stream = io.StringIO(file_contents.decode('utf-8'))
                 df = pd.read_csv(content_stream)
             except UnicodeDecodeError:
-                # Fallback to ISO-8859-1 (Common for older/gov CSVs)
+                # Fallback required for many UK gov/commercial CSVs
                 logger.info(f"Job {job.id}: UTF-8 decode failed, falling back to iso-8859-1 encoding.")
                 content_stream = io.StringIO(file_contents.decode('iso-8859-1'))
                 df = pd.read_csv(content_stream)
@@ -300,22 +297,32 @@ async def preprocess_uploaded_file(job: PipelineJob, file_contents: bytes, filen
 
         logger.info(f"Parsed DataFrame with shape: {df.shape}")
 
-        # --- FIX 3: RECOGNIZE 'Recipient Name' COLUMN ---
-        # Added your custom Land Reg column name to this list.
-        potential_company_cols = ['Recipient Name', 'company', 'company_name', 'name', 'target', 'business_name', 'addressee']
-        # -------------------------------------------------------------
+        # --- FIX: EXACT MATCH FOR YOUR CSV ---
+        # We define the list of columns that might contain the target business name.
+        # We move your actual column header to the top priority.
+        potential_company_cols = [
+            'Proprietor Name (1)', # Your primary company name column
+            'Recipient Name',      # Keeping fallback for previous testing
+            'company_name',        # Standard fallbacks
+            'company',
+            'name'
+        ]
+        # --------------------------------------------------
 
-        # Flexible detection: case-insensitive match from the potential list
+        # Flexible detection: case-insensitive match against the potential list
         columns_to_check_lower = [c.lower() for c in potential_company_cols]
+        # Check actual DF columns against the known lower-case synonyms
         found_col = next((col for col in df.columns if col.lower() in columns_to_check_lower), None)
 
         if not found_col:
-             raise HTTPException(status_code=400, detail=f"Required column 'company_name' (or known synonym) not found in upload. Columns found: {list(df.columns)}")
+             # This error was being triggered
+             raise HTTPException(status_code=400, detail=f"Required company name column (e.g., 'Proprietor Name (1)') not found in upload. Columns found: {list(df.columns)[:5]}...") # Log first few columns for brevity
 
         logger.info(f"Job {job.id}: Identified company name column: '{found_col}'")
 
-        # Extract and clean names, dropping duplicates/empties
+        # 2. Extract and clean names, dropping duplicates/empties
         raw_names = df[found_col].dropna().unique()
+        # Clean 'Proprietor Name (1)' values
         clean_company_names = [str(name).strip() for name in raw_names if str(name).strip()]
 
         logger.info(f"Job {job.id}: Preprocessing complete. Identified {len(clean_company_names)} unique target company names.")
