@@ -101,7 +101,7 @@ pipeline_jobs: Dict[str, PipelineJob] = {}
 async def root():
     return {"message": "ECA Pipeline API is operational."}
 
-# endpoint 1: /upload-leads/
+# endpoint 1: /upload-leads/ (UPDATED FIX)
 @app.post("/upload-leads/", response_model=PipelineJob)
 async def upload_leads_csv_start_pipeline(
     file: UploadFile = File(...),
@@ -120,8 +120,17 @@ async def upload_leads_csv_start_pipeline(
     Accepts CSV upload of target company names, starts the backend asynchronous pipeline,
     and returns a unique job ID immediately.
     """
-    if file.filename.endswith(('.csv', '.xlsx', '.xls')) is False:
+    # 0. Basic Validation
+    if not file.filename.lower().endswith(('.csv', '.xlsx', '.xls')):
         raise HTTPException(status_code=400, detail="Invalid file type. Please upload CSV or Excel.")
+
+    # --- FIX 1: CAPTURE FILE BYTES IN MAIN THREAD ---
+    # We must read the file contents *before* this main request thread finishes,
+    # otherwise FastAPI closes the file, and the background task crashes.
+    file_bytes_captured = await file.read() # Capture the contents now!
+    # Record filename for type checking in worker
+    original_filename = file.filename
+    # ------------------------------------------------------------------
 
     # 1. Create a unique ID and initialized Job record
     job_id = f"eca_job_{uuid.uuid4().hex[:8]}"
@@ -144,10 +153,12 @@ async def upload_leads_csv_start_pipeline(
     logger.info(f"Initialized job {job_id}. Status: {new_job.status}")
 
     # 2. Add the pipeline execution to background tasks
+    # WE NOW PASS THE CAPTURED BYTES AND FILENAME STRING.
     background_tasks.add_task(
         execute_full_pipeline,
         job_id,
-        file,
+        file_bytes_captured, # Passed bytes, not file object
+        original_filename,   # Passed original filename string
         google_api_key, google_cx_string,
         ch_api_key,
         hunter_api_key,
@@ -183,7 +194,8 @@ async def download_combined_results_csv(job_id: str):
 
 async def execute_full_pipeline(
     job_id: str,
-    file_upload: UploadFile,
+    file_bytes: bytes, # Updated: receives bytes
+    filename_for_type: str, # Updated: receives filename string
     google_api_key: Optional[str],
     google_cx_string: Optional[str],
     ch_api_key: Optional[str],
@@ -203,8 +215,10 @@ async def execute_full_pipeline(
         logger.warning(f"Job {job_id}: No FullEnrich API key provided. LinkedIn discovery will be skipped.")
 
     try:
-        # Step A: Pre-processing (Read File, Extract Names)
-        target_company_names = await preprocess_uploaded_file(job, file_upload)
+        # --- FIX 2: UPDATE PREPROCESSING CALL ---
+        # We pass the bytes and the filename.
+        target_company_names = await preprocess_uploaded_file(job, file_bytes, filename_for_type)
+        # ----------------------------------------------------------
 
         # Async HTTP Client for reusable connections
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -219,8 +233,7 @@ async def execute_full_pipeline(
                 domain_discovery_results = [] # Continue with empty list, or fallback needed
 
             # Step C: Optional Companies House Verification
-            # (If domains found are wrong/service.gov.uk, could attempt fallback search)
-            # This is complex fallback logic, placeholder for integration.
+            # (Placeholder for integration)
 
             # Step D: Hunter.io Contact Discovery
             if job.used_hunter and hunter_api_key and domain_discovery_results:
@@ -260,26 +273,46 @@ async def execute_full_pipeline(
 
 # --- 6. Pipeline Step Worker Functions ---
 
-# --- A. Preprocessing ---
-async def preprocess_uploaded_file(job: PipelineJob, file_upload: UploadFile) -> List[str]:
+# --- A. Preprocessing (UPDATED FIX) ---
+async def preprocess_uploaded_file(job: PipelineJob, file_contents: bytes, filename: str) -> List[str]:
+    """
+    Reads CSV/Excel bytes into Pandas, specifically looking for company name columns.
+    """
     logger.info(f"Job {job.id}: Starting preprocessing.")
-    contents = await file_upload.read()
+    # (Removed: await file_upload.read() - We already have the bytes)
 
     try:
-        # Load file contents into Pandas
-        if file_upload.filename.endswith('.csv'):
-            df = pd.read_csv(io.BytesIO(contents))
+        # Load file contents into Pandas (using the bytes object directly)
+        if filename.lower().endswith('.csv'):
+            # Convert bytes to string stream for CSV parser
+            # Need to specify encoding if it's not standard UTF-8 (e.g., Land Reg CSV might be ISO-8859-1)
+            try:
+                # Try standard UTF-8
+                content_stream = io.StringIO(file_contents.decode('utf-8'))
+                df = pd.read_csv(content_stream)
+            except UnicodeDecodeError:
+                # Fallback to ISO-8859-1 (Common for older/gov CSVs)
+                logger.info(f"Job {job.id}: UTF-8 decode failed, falling back to iso-8859-1 encoding.")
+                content_stream = io.StringIO(file_contents.decode('iso-8859-1'))
+                df = pd.read_csv(content_stream)
         else: # Excel
-            df = pd.read_excel(io.BytesIO(contents))
+            df = pd.read_excel(io.BytesIO(file_contents))
 
         logger.info(f"Parsed DataFrame with shape: {df.shape}")
-        # Assuming the CSV contains a column named 'company_name' or similar.
-        # Add flexibility to detect potential company column names.
-        potential_company_cols = ['company', 'company_name', 'name', 'target', 'business_name']
-        found_col = next((col for col in df.columns if col.lower() in potential_company_cols), None)
+
+        # --- FIX 3: RECOGNIZE 'Recipient Name' COLUMN ---
+        # Added your custom Land Reg column name to this list.
+        potential_company_cols = ['Recipient Name', 'company', 'company_name', 'name', 'target', 'business_name', 'addressee']
+        # -------------------------------------------------------------
+
+        # Flexible detection: case-insensitive match from the potential list
+        columns_to_check_lower = [c.lower() for c in potential_company_cols]
+        found_col = next((col for col in df.columns if col.lower() in columns_to_check_lower), None)
 
         if not found_col:
-             raise HTTPException(status_code=400, detail=f"Required column 'company_name' (or similar like 'company') not found in upload. Columns found: {list(df.columns)}")
+             raise HTTPException(status_code=400, detail=f"Required column 'company_name' (or known synonym) not found in upload. Columns found: {list(df.columns)}")
+
+        logger.info(f"Job {job.id}: Identified company name column: '{found_col}'")
 
         # Extract and clean names, dropping duplicates/empties
         raw_names = df[found_col].dropna().unique()
@@ -314,11 +347,10 @@ async def run_google_domain_discovery(
     for name in company_names:
         # 1. Clean the company name for optimal UK search
         search_name = re.sub(r'[^a-zA-Z0-9\s]', '', name) # Remove special chars
-        # Important UK suffix to target UK businesses in general search
-        query = quote_plus(f"{search_name} UK")
+        # Target UK businesses
+        query = quote_plus(f"{search_name} UK website")
 
         # 2. Perform the Google Search API Request
-        # (This combines the API Key and the Search Engine ID `cx`)
         google_url = f"https://www.googleapis.com/customsearch/v1?key={api_key}&cx={cx_string}&q={query}"
 
         discovered_domain = None
@@ -326,26 +358,26 @@ async def run_google_domain_discovery(
 
         try:
             response = await client.get(google_url)
-            # In a real environment, you must handle API errors (e.g., 429 quota, 400 bad key)
+            # रियल एन्वायरमेंट में API error handling (429 quota, 400 bad key)
             if response.status_code == 200:
                 search_data = response.json()
 
-                # Iterate through search results looking for a likely business homepage
+                # Iterate search results looking for business homepage
                 if 'items' in search_data and len(search_data['items']) > 0:
                     for item in search_data['items']:
                         item_link = item.get('link')
                         if not item_link: continue
 
                         parsed_url = urlparse(item_link)
-                        # We must exclude gov.uk domains that are not business homepages
-                        # And potentially exclude massive directories like LinkedIn profiles (unless needed).
+                        # Exclude gov.uk and large directories unless needed
                         netloc = parsed_url.netloc.lower()
-                        if '.gov.uk' not in netloc and '.linkedin.com/company/' not in netloc:
-                            # We found a potential business homepage domain!
-                            # Extract the root domain (e.g., company.co.uk)
+                        # Simple rule: if it doesn't have '.gov.uk' or known massive directories, treat it as the likely homepage
+                        massive_dirs = ['.gov.uk', '.linkedin.com/company/', '.facebook.com', '.instagram.com', 'companieshouse.gov.uk']
+                        if not any(dir_root in netloc for dir_root in massive_dirs):
+                            # Extract root domain (e.g., company.co.uk)
                             raw_domain = netloc.replace('www.', '')
                             discovered_domain = raw_domain
-                            break # Found the first suitable domain
+                            break # Found suitable domain
             else:
                  logger.error(f"Google API Error {response.status_code}: {response.text}")
 
@@ -354,7 +386,7 @@ async def run_google_domain_discovery(
 
         # 3. Add result, even if failed, for final accounting
         if discovered_domain:
-            # Avoid repeating discovery of the exact same domain for the same query set.
+            # Avoid duplicate recordings
             if discovered_domain not in discovered_domains_set:
                 info = DomainInfo(
                     provided_name=name,
@@ -366,14 +398,13 @@ async def run_google_domain_discovery(
                 discovered_domains_set.add(discovered_domain)
                 logger.info(f"Discovered domain '{discovered_domain}' for target '{name}'")
             else:
-                logger.info(f"Duplicate domain '{discovered_domain}' found for query '{name}'. Skipping recording duplicate.")
+                logger.info(f"Duplicate domain '{discovered_domain}' found for query '{name}'. Skipping.")
         else:
              info = DomainInfo(provided_name=name, discovered_domain=None) # No domain found
              results.append(info)
 
     # Update job tracker
     job.domains_discovered_count = len(discovered_domains_set)
-    # Convert result objects to simplified dicts for status response
     job.discovered_domains = [{"target": r.provided_name, "domain": r.discovered_domain if r.discovered_domain else "NONE FOUND"} for r in results if r.discovered_domain]
     job.updated_at = time.time()
     logger.info(f"Job {job.id}: Domain Discovery complete. Found {job.domains_discovered_count} unique domains.")
@@ -394,14 +425,13 @@ async def run_hunter_contact_discovery(
     total_emails = 0
     domains_processed_with_contacts = 0
 
-    # We only process entries where a domain was successfully discovered.
+    # Process only entry with successfully discovered domain
     domains_to_process = [r.discovered_domain for r in discovery_results if r.discovered_domain]
 
     for domain in domains_to_process:
         logger.info(f"Querying Hunter.io for domain: {domain}")
 
-        # 1. Prepare Hunter.io API Call (using the discovered root domain)
-        # `query` is the parameter for the domain, e.g., google.com
+        # 1. Prepare Hunter.io API Call
         hunter_url = f"https://api.hunter.io/v2/domain-search?domain={quote_plus(domain)}&limit={max_per_domain}&api_key={api_key}"
 
         discovery_result = ContactDiscoveryResult(domain=domain)
@@ -426,7 +456,7 @@ async def run_hunter_contact_discovery(
                             first_name=e.get('first_name'),
                             last_name=e.get('last_name'),
                             position=e.get('position')
-                            # Optional: Verification result can be added here if needed
+                            # Optional Verification result placeholder
                         )
                         structured_emails.append(employee)
 
@@ -440,14 +470,14 @@ async def run_hunter_contact_discovery(
         except httpx.RequestError as e:
             logger.error(f"HTTP Request error during Hunter.io Search: {e}")
 
-        # 3. Store result even if empty
+        # 3. Store result
         results.append(discovery_result)
 
     # Update job tracker
     job.total_emails_found_count = total_emails
     job.domains_with_emails_count = domains_processed_with_contacts
 
-    # Convert objects to simple dicts for status response
+    # Simplified data for status response
     job.discovered_contacts = []
     for r in results:
         for e in r.emails_found:
@@ -473,7 +503,7 @@ async def run_fullenrich_linkedin_discovery(
     logger.info(f"Job {job.id}: Starting Optional FullEnrich LinkedIn Discovery.")
     results = []
 
-    # 1. Flatten the list of all discovered emails to enrich
+    # 1. Flatten list of all discovered emails
     all_emails_to_enrich = []
     for contact_result in discovered_contacts:
         for employee_email in contact_result.emails_found:
@@ -484,72 +514,48 @@ async def run_fullenrich_linkedin_discovery(
     job.emails_sent_for_enrichment_count = total_emails_sent
     job.updated_at = time.time()
 
-    # If the user passed the optional key, we proceed. If it's missing (None), this loop shouldn't run based on execute_full_pipeline's check.
-    # We make a final check here just in case.
+    # Final optional key check (is redundant but safe)
     if not api_key:
-        logger.info(f"Job {job.id}: Optional FullEnrich key is None. Skipping further checks.")
-        return results # Or return special skipped entries.
+        logger.info(f"Job {job.id}: Optional FullEnrich key is None. Skipping.")
+        return results
 
-    logger.info(f"Job {job.id}: Optional FullEnrich active. Processing {total_emails_sent} potential contacts for LinkedIn profiles.")
+    logger.info(f"Job {job.id}: Optional FullEnrich active. Processing {total_emails_sent} contacts using provided Optional Key.")
 
     # --- Integration with FullEnrich Batch API ---
-    # FullEnrich typically uses a two-step batch process: Create Request, then Get Results.
-
+    # (Create Request, then Get Results)
     fullenrich_base_url = "https://api.fullenrich.com/v1" # Example Base URL
 
-    # Step E1: Create the Batch Enrichment Request
-    request_headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    request_body = {
-        "emails": all_emails_to_enrich,
-        # Potentially specify needed fields, like 'linkedin_profile'
-        "required_fields": ["linkedin_profile"]
-    }
-
     try:
-        # Create request response (Example: returns a 'batch_id')
-        # response = await client.post(f"{fullenrich_base_url}/batch/create", headers=request_headers, json=request_body)
+        # Step E1: Create Batch Enrichment Request (Real API would go here)
+        # request_body = { "emails": all_emails_to_enrich, "required_fields": ["linkedin_profile"] }
+        # response = await client.post(f"{fullenrich_base_url}/batch/create", headers=headers, json=request_body)
 
-        # MOCKING Step E1 and E2 for prototype purposes:
         logger.info(f"MOCK: FullEnrich batch enrichment requested for {total_emails_sent} emails using provided Optional Key.")
-        # and would return successful enrichment profiles
 
-        # We will mock the enrichment result of a hypothetical successful match.
-        # This replaces real API calls that would be configured here using the provided key.
-        # It shows how the data structure handles the successful return from the optional stage.
-        mock_fullenrich_return_profile = FullEnrichProfile(
+        # MOCK SUCCESSFUL Match data structure:
+        mock_profile = FullEnrichProfile(
              linkedin_url="https://www.linkedin.com/in/john.doe-123",
-             profile_data={
-                 "name": "John Doe",
-                 "headline": "Example CEO | Software Solutions UK",
-                 "company": "Software Solutions Limited",
-                 "experience": [{"title": "CEO", "company": "Software Solutions"}]
-                 }
+             profile_data={"name": "John Doe", "headline": "CEO | Software Solutions UK"}
         )
-        # Assuming the MOCK finds a match for one hypothetical email for testing.
-        match_made = False
+        match_made = False # Mock just one match for testing
 
-        # Iterate and build results (Mocking successful profile found if the logic returns matches)
+        # 3. Iterate emails and build result objects
         for email in all_emails_to_enrich:
 
-            enrichment_status = 'Skipped (Optional)' # By default assume it was skipped because key is checked optional.
+            enrichment_status = 'No Profile Found'
             profile_found = None
 
-            # --- Check optional key and process if possible (MOCK LOGIC) ---
-            if api_key: # Key exists (optional is active)
-                # Real API would populate this successful result profile.
-                if not match_made: # Mocking one successful profile match
-                    profile_found = mock_fullenrich_return_profile
+            # --- Check optional key and process (MOCK LOGIC) ---
+            # Using redudant 'if api_key' check to signify optional path
+            if api_key:
+                if not match_made: # Mocking one match
+                    profile_found = mock_profile
                     linkedin_found += 1
                     match_made = True
                     enrichment_status = 'Success'
                     logger.info(f"MOCK FullEnrich: LinkedIn Profile found for {email}")
-                else:
-                    enrichment_status = 'No Profile Found' # Profile wasn't located by API
 
-            # Record the result object
+            # Record result
             res = FullEnrichResult(
                 source_email=email,
                 linkedin_profile=profile_found,
@@ -560,12 +566,12 @@ async def run_fullenrich_linkedin_discovery(
     except Exception as e:
         logger.error(f"HTTP Request error during FullEnrich Step: {e}")
         job.status = "Error (FullEnrich)"
-        raise # Rethrow critical error
+        raise # Rethrow
 
-    # Update job tracker based on final match counts
+    # Update tracker
     job.linkedin_profiles_found_count = linkedin_found
 
-    # Convert objects to simple dicts for status response
+    # Simplified data for status response
     job.fullenrich_matches = []
     for r in results:
         if r.linkedin_profile:
@@ -576,7 +582,7 @@ async def run_fullenrich_linkedin_discovery(
             })
 
     job.updated_at = time.time()
-    logger.info(f"Job {job.id}: Optional FullEnrich complete. Found {job.linkedin_profiles_found_count} matched LinkedIn profiles using provided key.")
+    logger.info(f"Job {job.id}: Optional FullEnrich complete. Found {job.linkedin_profiles_found_count} matched LinkedIn profiles.")
     return results
 
 # --- F. Final Data Combination ---
@@ -590,7 +596,7 @@ async def combine_and_finalize_results(
     logger.info(f"Job {job.id}: Starting final data combination.")
     combined_results = []
 
-    # Flatten structure and map results back to the original company names and domains
+    # Map results back to original company names and domains
 
     # 1. Flatten discovery results for mapping target->domain
     domain_map = {r.provided_name: (r.discovered_domain if r.discovered_domain else None) for r in domains}
@@ -598,18 +604,18 @@ async def combine_and_finalize_results(
     # 2. Flatten contact discovery for mapping domain->emails list
     contact_map = {r.domain: r.emails_found for r in contacts}
 
-    # 3. Flatten enrichment results for mapping email->LinkedIn/Profile
+    # 3. Flatten enrichment results mapping email->LinkedIn/Profile
     enrichment_map = {r.source_email: r.linkedin_profile for r in enrichments if r.linkedin_profile}
     enrichment_status_map = {r.source_email: r.enrichment_status for r in enrichments}
 
-    # Iterate through each original company target to create output rows
+    # Iterate original company target to create output rows
     for company_name in company_names:
 
         discovered_domain = domain_map.get(company_name)
         emails = contact_map.get(discovered_domain) if discovered_domain else None
 
         if not discovered_domain:
-            # Handle companies with no found domain
+            # Handle companies with no domain found
             row = {
                 "Target Company Name": company_name,
                 "Discovered Domain": "NONE FOUND (Google)",
@@ -621,10 +627,10 @@ async def combine_and_finalize_results(
                 "Discovery Pipeline Status": "Domain Failed"
             }
             combined_results.append(row)
-            continue # Move to next company
+            continue # Next
 
         if not emails:
-             # Handle domain found but no contacts
+             # Domain found but no contacts
              row = {
                 "Target Company Name": company_name,
                 "Discovered Domain": discovered_domain,
@@ -636,15 +642,15 @@ async def combine_and_finalize_results(
                 "Discovery Pipeline Status": "Contacts Failed"
             }
              combined_results.append(row)
-             continue # Move to next company
+             continue # Next
 
-        # 4. Companies with domains AND contacts: create a row for each employee
+        # 4. Companies with contacts: row for each employee
         for email in emails:
 
             enrichment_profile = enrichment_map.get(email.email)
             enrichment_status = enrichment_status_map.get(email.email, "Pending/Skipped (Optional)")
 
-            # Map enrichment_profile to a more useful description of what was found (LinkedIn vs generic vs skipped)
+            # Map enrichment_profile to summary
             full_enrich_status_summary = enrichment_status
             if enrichment_profile:
                 if enrichment_profile.linkedin_url:
@@ -652,34 +658,32 @@ async def combine_and_finalize_results(
                 elif enrichment_profile.profile_data:
                     full_enrich_status_summary = "Success (Generic Profile/Waitlist)"
 
-            # If FullEnrich was marked as optional/skipped because of no key, summarize this.
+            # optional/skipped summarize this.
             if enrichment_status == "Skipped (Optional)" and not job.used_fullenrich:
                  full_enrich_status_summary = "Skipped (FullEnrich Key Optional/Missing)"
 
             row = {
                 "Target Company Name": company_name,
                 "Discovered Domain": discovered_domain,
-                "Employee Name": f"{email.first_name} {email.last_name}" if (email.first_name and email.last_name) else "UNIDENTIFIED",
-                "Employee Position": email.position if email.position else "UNIDENTIFIED",
+                "Employee Name": f"{email.first_name} {email.last_name}" if (e.first_name and e.last_name) else "UNIDENTIFIED",
+                "Employee Position": email.position if e.position else "UNIDENTIFIED",
                 "Employee Email": email.email,
                 "LinkedIn URL": enrichment_profile.linkedin_url if (enrichment_profile and enrichment_profile.linkedin_url) else "NONE FOUND",
-                "FullEnrich Profile": full_enrich_status_summary, # Contains the detailed success/skip summary
+                "FullEnrich Profile": full_enrich_status_summary, # Contains detailed success/skip summary
                 "Discovery Pipeline Status": "Pipeline Complete"
             }
             combined_results.append(row)
 
-    # Convert object to simplified JSON serializable lists/dicts
+    # Simplified lists for status response
     job.final_combined_results = combined_results
     job.updated_at = time.time()
-    logger.info(f"Job {job.id}: Final Data Combination complete. Generated {len(combined_results)} output rows across all companies.")
+    logger.info(f"Job {job.id}: Final Combination complete. Generated {len(combined_results)} output rows.")
 
 # --- 7. Main Execution Entry Point ---
-# Run the FastAPI server using Uvicorn:
 # uvicorn main:app --reload
-# Access Interactive Documentation: http://127.0.0.1:8000/docs
+# http://127.0.0.1:8000/docs
 
 if __name__ == "__main__":
     import uvicorn
-    # Use the port specified in the ' vibecode' deployment examples or default 8000.
-    # The --reload flag should be handled by the command line, not code when running via Python.
+    # deployment examples port
     uvicorn.run("main:app", host="127.0.0.1", port=8000, log_level="info")
