@@ -86,7 +86,7 @@ app = FastAPI(title="ECA Cold Email Pipeline", description="Lead Enrichment & Au
 
 app.add_middleware(
     CORSMiddleware,
-    # TODO: Change "*" to "https://tool.ecatax.co.uk" before giving clients access
+    # TODO: Change "*" to "https://tool.ecatax.co.uk" before giving clients access in production
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
@@ -231,7 +231,7 @@ async def execute_full_pipeline(
             else:
                 discovered_contacts = []
 
-            # Step E: FullEnrich LinkedIn Discovery (Skipped / Placeholder)
+            # Step E: FullEnrich LinkedIn Discovery (Placeholder)
             enrichment_results = []
 
             # Step F: Final Data Combination
@@ -291,8 +291,10 @@ async def run_serper_domain_discovery(job: PipelineJob, client: httpx.AsyncClien
     discovered_domains_set: Set[str] = set()
 
     for name in company_names:
-        search_name = re.sub(r'[^a-zA-Z0-9\s]', '', name)
-        query = f"{search_name} UK website"
+        search_name = re.sub(r'[^a-zA-Z0-9\s]', '', name).strip()
+
+        # 1. Stricter Exact Match Google Query
+        query = f'"{search_name}" UK website'
         serper_url = "https://google.serper.dev/search"
         headers = {'X-API-KEY': api_key, 'Content-Type': 'application/json'}
         payload = {"q": query, "gl": "gb"}
@@ -306,10 +308,31 @@ async def run_serper_domain_discovery(job: PipelineJob, client: httpx.AsyncClien
                     item_link = item.get('link')
                     if not item_link: continue
                     netloc = urlparse(item_link).netloc.lower()
-                    massive_dirs = ['.gov.uk', '.linkedin.com', '.facebook.com', 'companieshouse.gov.uk']
-                    if not any(dir_root in netloc for dir_root in massive_dirs):
-                        discovered_domain = netloc.replace('www.', '')
-                        break
+
+                    # Exclude major aggregators, social networks, and directories
+                    massive_dirs = ['.gov.uk', '.linkedin.com', '.facebook.com', '.instagram.com',
+                                    'companieshouse.gov.uk', 'endole.co.uk', 'yell.com', '192.com',
+                                    'dnb.com', 'bloomberg.com', 'zoominfo.com', 'check-a-trade.com']
+                    if any(dir_root in netloc for dir_root in massive_dirs):
+                        continue
+
+                    raw_domain = netloc.replace('www.', '')
+
+                    # 2. Strict Domain Relevance Cross-check
+                    # Strip generic corporate terms from the search name
+                    stop_words = {'limited', 'ltd', 'uk', 'plc', 'group', 'services', 'co', 'corp'}
+                    name_words = [w.lower() for w in search_name.split() if w.lower() not in stop_words and len(w) > 2]
+                    domain_clean = re.sub(r'[^a-z0-9]', '', raw_domain.split('.')[0])
+
+                    # Verify at least one significant word from the company name exists in the domain root
+                    if name_words:
+                        match = any(word in domain_clean for word in name_words)
+                        if not match:
+                            logger.info(f"Rejected domain '{raw_domain}' for '{name}': No core name words matched.")
+                            continue
+
+                    discovered_domain = raw_domain
+                    break
         except httpx.RequestError as e:
             logger.error(f"Serper error: {e}")
 
@@ -327,6 +350,8 @@ async def run_hunter_contact_discovery(job: PipelineJob, client: httpx.AsyncClie
     total_emails = 0
     domains_to_process = [r.discovered_domain for r in discovery_results if r.discovered_domain]
 
+    generic_prefixes = ('info@', 'admin@', 'customercare@', 'customer.service@', 'onlinehelp@', 'sales@', 'support@', 'help@', 'contact@', 'office@', 'enquiries@')
+
     for domain in domains_to_process:
         hunter_url = f"https://api.hunter.io/v2/domain-search?domain={quote_plus(domain)}&limit={max_per_domain}&api_key={api_key}"
         discovery_result = ContactDiscoveryResult(domain=domain)
@@ -337,10 +362,24 @@ async def run_hunter_contact_discovery(job: PipelineJob, client: httpx.AsyncClie
                 hunter_data = response.json().get('data', {})
                 emails_found = hunter_data.get('emails', [])
                 if emails_found:
-                    structured_emails = [
-                        EmployeeEmail(email=e.get('value'), type=e.get('type'), first_name=e.get('first_name'), last_name=e.get('last_name'), position=e.get('position'))
-                        for e in emails_found
-                    ]
+                    structured_emails = []
+                    for e in emails_found:
+                        email_val = e.get('value', '').lower()
+                        email_type = e.get('type')
+
+                        # 3. Filter out generic/role-based emails
+                        if email_type == 'generic' or any(email_val.startswith(p) for p in generic_prefixes):
+                            continue
+
+                        employee = EmployeeEmail(
+                            email=email_val,
+                            type=email_type,
+                            first_name=e.get('first_name'),
+                            last_name=e.get('last_name'),
+                            position=e.get('position')
+                        )
+                        structured_emails.append(employee)
+
                     discovery_result.emails_found = structured_emails
                     total_emails += len(structured_emails)
         except httpx.RequestError as e:
@@ -383,8 +422,7 @@ async def send_outreach_emails(job: PipelineJob, smtp_user: str, smtp_pass: str)
     logger.info(f"Job {job.id}: Starting email outreach...")
     blacklist = load_blacklist()
 
-    # NOTE: Once deployed on Render, set this to your Render URL (e.g., https://api-ecatax.onrender.com)
-    # so the unsubscribe links work dynamically over the web.
+    # Render maps environment variables. If missing, defaults to localhost
     base_url = os.environ.get("RENDER_EXTERNAL_URL", "http://127.0.0.1:8000")
 
     template_str = """
@@ -449,5 +487,5 @@ async def send_outreach_emails(job: PipelineJob, smtp_user: str, smtp_pass: str)
 # --- 7. Main Execution Entry Point ---
 if __name__ == "__main__":
     import uvicorn
-    # This block is used for local testing. Render uses the startCommand configured in the dashboard.
+    # Local execution. Render uses the Start Command in the dashboard.
     uvicorn.run("main:app", host="127.0.0.1", port=8000, log_level="info")
