@@ -293,8 +293,8 @@ async def run_serper_domain_discovery(job: PipelineJob, client: httpx.AsyncClien
     for name in company_names:
         search_name = re.sub(r'[^a-zA-Z0-9\s]', '', name).strip()
 
-        # 1. Stricter Exact Match Google Query
-        query = f'"{search_name}" UK website'
+        # 1. Unquoted query for fuzzy Google matching
+        query = f"{search_name} UK website"
         serper_url = "https://google.serper.dev/search"
         headers = {'X-API-KEY': api_key, 'Content-Type': 'application/json'}
         payload = {"q": query, "gl": "gb"}
@@ -317,19 +317,28 @@ async def run_serper_domain_discovery(job: PipelineJob, client: httpx.AsyncClien
                         continue
 
                     raw_domain = netloc.replace('www.', '')
-
-                    # 2. Strict Domain Relevance Cross-check
-                    # Strip generic corporate terms from the search name
-                    stop_words = {'limited', 'ltd', 'uk', 'plc', 'group', 'services', 'co', 'corp'}
-                    name_words = [w.lower() for w in search_name.split() if w.lower() not in stop_words and len(w) > 2]
                     domain_clean = re.sub(r'[^a-z0-9]', '', raw_domain.split('.')[0])
 
-                    # Verify at least one significant word from the company name exists in the domain root
-                    if name_words:
-                        match = any(word in domain_clean for word in name_words)
-                        if not match:
-                            logger.info(f"Rejected domain '{raw_domain}' for '{name}': No core name words matched.")
-                            continue
+                    # 2. Smart Relevance Cross-check
+                    clean_name = re.sub(r'[^a-zA-Z0-9\s]', '', name.replace('&', ' and ')).lower()
+                    stop_words = {'limited', 'ltd', 'uk', 'plc', 'group', 'co', 'corp', 'the', 'inc', 'and'}
+                    tokens = [w for w in clean_name.split() if w not in stop_words]
+
+                    if tokens:
+                        matched_tokens = [t for t in tokens if t in domain_clean]
+                        if not matched_tokens:
+                            continue # No core words match
+
+                        # If no distinct word (4+ chars) matches, ensure the short words make up at least 40% of the domain string.
+                        # This prevents "JD Belper" -> "jdsports" because 'jd' is only 25% of 'jdsports'
+                        if not any(len(t) >= 4 for t in matched_tokens):
+                            matched_chars = sum(len(t) for t in matched_tokens)
+                            for sw in ['ltd', 'group', 'uk', 'co']:
+                                if domain_clean.endswith(sw): matched_chars += len(sw)
+
+                            if (len(domain_clean) > 0) and (matched_chars / len(domain_clean)) < 0.4:
+                                logger.info(f"Rejected domain '{raw_domain}' for '{name}': Short tokens did not meet 40% threshold.")
+                                continue
 
                     discovered_domain = raw_domain
                     break
