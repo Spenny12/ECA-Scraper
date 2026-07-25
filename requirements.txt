@@ -4,5 +4,6 @@ pandas
 httpx
 jinja2
 openpyxl
+xlrd
 python-multipart
 supabase
