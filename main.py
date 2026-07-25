@@ -16,13 +16,13 @@ from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 import store
 from config import CH_API_KEY, MAX_UPLOAD_BYTES, SERPER_API_KEY, logger
 from emailer import execute_bulk_send
 from models import BulkEmailJob, PipelineJob
-from pipeline import execute_full_pipeline
+from pipeline import execute_full_pipeline, results_to_csv_bytes
 
 app = FastAPI(title="ECA Pipeline & Sender API", description="Lead Enrichment & Bulk Email Sender")
 
@@ -110,6 +110,24 @@ async def get_pipeline_job_status(job_id: str):
     if job_id not in store.pipeline_jobs:
         raise HTTPException(status_code=404, detail="Job not found.")
     return store.pipeline_jobs[job_id]
+
+
+@app.get("/pipeline-results/{job_id}/export")
+async def export_pipeline_results_csv(job_id: str):
+    if job_id not in store.pipeline_jobs:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    job = store.pipeline_jobs[job_id]
+    if job.status != "Complete":
+        raise HTTPException(status_code=409, detail=f"Job is not complete yet (status: {job.status}).")
+    if not job.final_combined_results:
+        raise HTTPException(status_code=404, detail="Job completed with no results to export.")
+
+    csv_bytes = results_to_csv_bytes(job.final_combined_results)
+    return StreamingResponse(
+        iter([csv_bytes]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{job_id}_leads.csv"'},
+    )
 
 
 # --- TOOL 2: THE BULK SENDER ---

@@ -166,3 +166,11 @@ def _rows_for_company(name, dom_map, con_map, ch_map, company_metadata) -> list:
     return [{**base, "Discovered Domain": "NONE FOUND (Serper)", "Employee Name": director,
               "Employee Position": "Director (CH)", "Employee Email": "NONE FOUND (SPV)",
               "Status": "SPV Fallback (CH)"}]
+
+
+def results_to_csv_bytes(results: list) -> bytes:
+    """Serializes a job's final_combined_results into CSV bytes with the
+    exact column headers /bulk-send/ expects, so the export can be fed
+    straight back in without editing."""
+    df = pd.DataFrame(results)
+    return df.to_csv(index=False).encode('utf-8')
