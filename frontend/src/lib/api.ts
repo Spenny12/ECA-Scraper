@@ -1,13 +1,17 @@
 import type { PipelineJob } from "../types";
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL;
+const RAW_API_BASE = import.meta.env.VITE_API_BASE_URL;
 
-if (!API_BASE) {
+if (!RAW_API_BASE) {
   throw new Error(
     "VITE_API_BASE_URL is not set. Configure it as a build environment variable " +
       "(e.g. in Cloudflare Pages project settings) for both Production and Preview."
   );
 }
+
+// Strip any trailing slash(es) so a value like "https://host.com/" doesn't
+// produce a double slash once this module appends its own leading "/path".
+const API_BASE = RAW_API_BASE.replace(/\/+$/, "");
 
 const STATUS_TIMEOUT_MS = 30_000;
 const UPLOAD_TIMEOUT_MS = 60_000;
