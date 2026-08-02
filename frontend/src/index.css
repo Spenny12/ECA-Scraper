@@ -1,0 +1,25 @@
+@import "tailwindcss";
+
+@import "@fontsource/plus-jakarta-sans/400.css";
+@import "@fontsource/plus-jakarta-sans/500.css";
+@import "@fontsource/plus-jakarta-sans/600.css";
+@import "@fontsource/plus-jakarta-sans/700.css";
+@import "@fontsource/plus-jakarta-sans/800.css";
+
+/* Brand tokens pulled from ecataxassociates.co.uk */
+@theme {
+  --color-brand-teal: #008080;
+  --color-brand-teal-dark: #006666;
+  --color-brand-coral: #ff7854;
+  --color-brand-navy: #0f172a;
+  --font-sans: "Plus Jakarta Sans", system-ui, sans-serif;
+}
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+  font-family: "Plus Jakarta Sans", system-ui, sans-serif;
+}
