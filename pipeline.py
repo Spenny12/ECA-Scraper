@@ -127,17 +127,19 @@ def _extract_companies(df: pd.DataFrame, proprietor_cols: list, generic_col: str
 
 def combine_results(company_names, domains, contacts, ch_data, company_metadata) -> list:
     dom_map = {r.provided_name: r.discovered_domain for r in domains}
+    conf_map = {r.provided_name: r.match_confidence for r in domains}
     con_map = {r.domain: r.emails_found for r in contacts}
     ch_map = {c.company_name: c for c in ch_data}
 
     combined = []
     for name in company_names:
-        combined.extend(_rows_for_company(name, dom_map, con_map, ch_map, company_metadata))
+        combined.extend(_rows_for_company(name, dom_map, conf_map, con_map, ch_map, company_metadata))
     return combined
 
 
-def _rows_for_company(name, dom_map, con_map, ch_map, company_metadata) -> list:
+def _rows_for_company(name, dom_map, conf_map, con_map, ch_map, company_metadata) -> list:
     domain = dom_map.get(name)
+    confidence = conf_map.get(name)
     emails = con_map.get(domain) if domain else None
     ch = ch_map.get(name)
     meta = company_metadata.get(name, {})
@@ -155,17 +157,17 @@ def _rows_for_company(name, dom_map, con_map, ch_map, company_metadata) -> list:
         rows = []
         for e in emails:
             person = f"{e.first_name} {e.last_name}" if e.first_name else director
-            rows.append({**base, "Discovered Domain": domain, "Employee Name": person,
-                         "Employee Position": e.position or "Director", "Employee Email": e.email,
-                         "Status": "Complete (Email Found)"})
+            rows.append({**base, "Discovered Domain": domain, "Domain Match Confidence": confidence,
+                         "Employee Name": person, "Employee Position": e.position or "Director",
+                         "Employee Email": e.email, "Status": "Complete (Email Found)"})
         return rows
     if domain:
-        return [{**base, "Discovered Domain": domain, "Employee Name": director,
-                  "Employee Position": "Director (CH)", "Employee Email": "NONE FOUND (Hunter)",
-                  "Status": "Domain Found (No Email)"}]
-    return [{**base, "Discovered Domain": "NONE FOUND (Serper)", "Employee Name": director,
-              "Employee Position": "Director (CH)", "Employee Email": "NONE FOUND (SPV)",
-              "Status": "SPV Fallback (CH)"}]
+        return [{**base, "Discovered Domain": domain, "Domain Match Confidence": confidence,
+                  "Employee Name": director, "Employee Position": "Director (CH)",
+                  "Employee Email": "NONE FOUND (Hunter)", "Status": "Domain Found (No Email)"}]
+    return [{**base, "Discovered Domain": "NONE FOUND (Serper)", "Domain Match Confidence": None,
+              "Employee Name": director, "Employee Position": "Director (CH)",
+              "Employee Email": "NONE FOUND (SPV)", "Status": "SPV Fallback (CH)"}]
 
 
 def results_to_csv_bytes(results: list) -> bytes:

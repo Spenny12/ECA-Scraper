@@ -9,6 +9,7 @@ class DomainInfo(BaseModel):
     discovered_domain: Optional[str] = None
     discovery_method: Optional[str] = None
     search_query_used: Optional[str] = None
+    match_confidence: Optional[float] = None
 
 
 class EmployeeEmail(BaseModel):
