@@ -22,7 +22,7 @@ PROPRIETOR_NAME_COL_RE = re.compile(r'^Proprietor Name \(\d+\)$', re.IGNORECASE)
 GENERIC_NAME_COLS = ('Recipient Name', 'company_name', 'company', 'name')
 
 
-async def execute_full_pipeline(job_id, file_bytes, filename, serper_api_key, ch_api_key, hunter_api_key, max_contacts):
+async def execute_full_pipeline(job_id, file_bytes, filename, serper_api_key, ch_api_key, hunter_api_key, max_directors):
     job = store.pipeline_jobs[job_id]
     try:
         company_names, company_metadata = preprocess_uploaded_file(job, file_bytes, filename)
@@ -39,8 +39,16 @@ async def execute_full_pipeline(job_id, file_bytes, filename, serper_api_key, ch
             # the source sheet), used for exact lookups instead of a fuzzy
             # name search that can match the wrong company.
             ch_data = await companies_house.enrich_companies(job, client, company_names, company_metadata, ch_api_key) if ch_api_key else []
-            contacts = await hunter.discover_contacts(job, client, domains, hunter_api_key, max_contacts) if hunter_api_key else []
-            job.final_combined_results = combine_results(company_names, domains, contacts, ch_data, company_metadata)
+
+            dom_map = {d.provided_name: d.discovered_domain for d in domains}
+            ch_map = {c.company_name: c for c in ch_data}
+            # Hunter is targeted at the specific directors Companies House
+            # returned, so it needs both maps rather than just the domain list.
+            contacts_by_company = (
+                await hunter.discover_director_emails(job, client, company_names, dom_map, ch_map, hunter_api_key, max_directors)
+                if hunter_api_key else {}
+            )
+            job.final_combined_results = combine_results(company_names, domains, contacts_by_company, ch_data, company_metadata)
     except Exception as e:
         logger.error(f"Pipeline error {job_id}: {e}")
         job.status = "Error"
@@ -125,22 +133,22 @@ def _extract_companies(df: pd.DataFrame, proprietor_cols: list, generic_col: str
     return {display_name[key]: meta for key, meta in company_metadata.items()}
 
 
-def combine_results(company_names, domains, contacts, ch_data, company_metadata) -> list:
+def combine_results(company_names, domains, contacts_by_company, ch_data, company_metadata) -> list:
     dom_map = {r.provided_name: r.discovered_domain for r in domains}
     conf_map = {r.provided_name: r.match_confidence for r in domains}
-    con_map = {r.domain: r.emails_found for r in contacts}
     ch_map = {c.company_name: c for c in ch_data}
 
     combined = []
     for name in company_names:
-        combined.extend(_rows_for_company(name, dom_map, conf_map, con_map, ch_map, company_metadata))
+        combined.extend(_rows_for_company(name, dom_map, conf_map, contacts_by_company, ch_map, company_metadata))
     return combined
 
 
-def _rows_for_company(name, dom_map, conf_map, con_map, ch_map, company_metadata) -> list:
+def _rows_for_company(name, dom_map, conf_map, contacts_by_company, ch_map, company_metadata) -> list:
     domain = dom_map.get(name)
     confidence = conf_map.get(name)
-    emails = con_map.get(domain) if domain else None
+    contact_result = contacts_by_company.get(name)
+    emails = contact_result.emails_found if contact_result else None
     ch = ch_map.get(name)
     meta = company_metadata.get(name, {})
 
@@ -156,18 +164,29 @@ def _rows_for_company(name, dom_map, conf_map, con_map, ch_map, company_metadata
     if domain and emails:
         rows = []
         for e in emails:
-            person = f"{e.first_name} {e.last_name}" if e.first_name else director
+            # Every email here was looked up by a specific director's name,
+            # so e.first_name/last_name always correspond to that director -
+            # no generic-inbox fallback needed.
+            person = f"{e.first_name} {e.last_name}"
             rows.append({**base, "Discovered Domain": domain, "Domain Match Confidence": confidence,
                          "Employee Name": person, "Employee Position": e.position or "Director",
                          "Employee Email": e.email, "Status": "Complete (Email Found)"})
         return rows
-    if domain:
+    if domain and ch and ch.directors:
         return [{**base, "Discovered Domain": domain, "Domain Match Confidence": confidence,
                   "Employee Name": director, "Employee Position": "Director (CH)",
-                  "Employee Email": "NONE FOUND (Hunter)", "Status": "Domain Found (No Email)"}]
+                  "Employee Email": "NONE FOUND (Hunter)", "Status": "Domain Found (No Director Email)"}]
+    if domain:
+        return [{**base, "Discovered Domain": domain, "Domain Match Confidence": confidence,
+                  "Employee Name": director, "Employee Position": "N/A",
+                  "Employee Email": "NONE FOUND (No CH Directors)", "Status": "Domain Found (No CH Directors)"}]
+    if ch and ch.directors:
+        return [{**base, "Discovered Domain": "NONE FOUND (Serper)", "Domain Match Confidence": None,
+                  "Employee Name": director, "Employee Position": "Director (CH)",
+                  "Employee Email": "NONE FOUND (SPV)", "Status": "SPV Fallback (CH)"}]
     return [{**base, "Discovered Domain": "NONE FOUND (Serper)", "Domain Match Confidence": None,
-              "Employee Name": director, "Employee Position": "Director (CH)",
-              "Employee Email": "NONE FOUND (SPV)", "Status": "SPV Fallback (CH)"}]
+              "Employee Name": director, "Employee Position": "N/A",
+              "Employee Email": "NONE FOUND", "Status": "Not Found"}]
 
 
 def results_to_csv_bytes(results: list) -> bytes:

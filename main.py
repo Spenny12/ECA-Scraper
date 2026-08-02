@@ -21,6 +21,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 import store
 from config import CH_API_KEY, MAX_UPLOAD_BYTES, SERPER_API_KEY, logger
 from emailer import execute_bulk_send
+from hubspot_sync import sync_results_to_hubspot
 from models import BulkEmailJob, PipelineJob
 from pipeline import execute_full_pipeline, results_to_csv_bytes
 
@@ -87,7 +88,11 @@ async def unsubscribe(email: str):
 async def upload_leads_csv_start_pipeline(
     file: UploadFile = File(...),
     hunter_api_key: Optional[str] = Form(None),
-    max_contacts_per_domain: int = Form(10),
+    # This caps how many Companies House directors per company get a Hunter
+    # Email Finder lookup attempted (1 Hunter credit per director, whether
+    # or not an email is found) - it is NOT a guaranteed number of emails
+    # returned. See hunter.py's discover_director_emails for details.
+    max_directors_per_company: int = Form(4),
     background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     file_bytes = await file.read()
@@ -100,7 +105,7 @@ async def upload_leads_csv_start_pipeline(
 
     background_tasks.add_task(
         execute_full_pipeline, job_id, file_bytes, file.filename,
-        SERPER_API_KEY, CH_API_KEY, hunter_api_key, max_contacts_per_domain
+        SERPER_API_KEY, CH_API_KEY, hunter_api_key, max_directors_per_company
     )
     return new_job
 
@@ -128,6 +133,22 @@ async def export_pipeline_results_csv(job_id: str):
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{job_id}_leads.csv"'},
     )
+
+
+@app.post("/pipeline-results/{job_id}/sync-hubspot")
+async def sync_pipeline_results_to_hubspot(job_id: str):
+    if job_id not in store.pipeline_jobs:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    job = store.pipeline_jobs[job_id]
+    if job.status != "Complete":
+        raise HTTPException(status_code=409, detail=f"Job is not complete yet (status: {job.status}).")
+    if not job.final_combined_results:
+        raise HTTPException(status_code=404, detail="Job completed with no results to sync.")
+
+    try:
+        return await sync_results_to_hubspot(job.final_combined_results)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # --- TOOL 2: THE BULK SENDER ---
