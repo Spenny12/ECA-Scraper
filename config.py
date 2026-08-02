@@ -10,6 +10,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY")
 CH_API_KEY = os.environ.get("CH_API_KEY")
+HUBSPOT_ACCESS_TOKEN = os.environ.get("HUBSPOT_ACCESS_TOKEN")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://127.0.0.1:8000")
 
 # --- Upload / job limits ---
