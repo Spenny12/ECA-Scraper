@@ -1,4 +1,5 @@
 """Companies House lookups: registered address + active directors."""
+import asyncio
 from urllib.parse import quote_plus
 
 from config import logger
@@ -6,6 +7,18 @@ from models import CHCompanyData
 
 BASE_URL = "https://api.company-information.service.gov.uk"
 ACTIVE_DIRECTOR_ROLES = ("director", "nominee-director")
+
+
+async def _get_with_retry(client, url, auth):
+    """Wraps client.get with an automatic pause-and-retry if we hit a 429 Rate Limit."""
+    for attempt in range(6):  # Will wait up to 6 minutes if the 5-minute bucket just reset
+        res = await client.get(url, auth=auth)
+        if res.status_code == 429:
+            logger.warning(f"Companies House API rate limit hit (429). Pausing for 60 seconds (Attempt {attempt + 1}/6)...")
+            await asyncio.sleep(60)
+            continue
+        return res
+    return res  # Return the last response if we exhausted all retries
 
 
 async def enrich_companies(job, client, company_names, company_metadata, api_key):
@@ -39,7 +52,7 @@ async def _enrich_one(client, auth, name, known_number) -> CHCompanyData:
 
 
 async def _lookup_by_number(client, auth, info: CHCompanyData, name: str, known_number: str):
-    res = await client.get(f"{BASE_URL}/company/{quote_plus(known_number)}", auth=auth)
+    res = await _get_with_retry(client, f"{BASE_URL}/company/{quote_plus(known_number)}", auth)
     if res.status_code != 200:
         logger.warning(
             f"CH direct lookup for '{name}' (no. {known_number}) returned HTTP {res.status_code}; "
@@ -54,7 +67,7 @@ async def _lookup_by_number(client, auth, info: CHCompanyData, name: str, known_
 
 
 async def _lookup_by_name(client, auth, info: CHCompanyData, name: str):
-    res = await client.get(f"{BASE_URL}/search/companies?q={quote_plus(name)}", auth=auth)
+    res = await _get_with_retry(client, f"{BASE_URL}/search/companies?q={quote_plus(name)}", auth)
     if res.status_code != 200:
         logger.warning(f"CH name search for '{name}' returned HTTP {res.status_code}")
         return
@@ -77,7 +90,7 @@ async def _lookup_by_name(client, auth, info: CHCompanyData, name: str):
 
 
 async def _fetch_active_directors(client, auth, company_number: str) -> list:
-    res = await client.get(f"{BASE_URL}/company/{company_number}/officers", auth=auth)
+    res = await _get_with_retry(client, f"{BASE_URL}/company/{company_number}/officers", auth)
     if res.status_code != 200:
         logger.warning(f"CH officers lookup for {company_number} returned HTTP {res.status_code}")
         return []
