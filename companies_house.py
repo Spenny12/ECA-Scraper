@@ -48,7 +48,9 @@ async def _lookup_by_number(client, auth, info: CHCompanyData, name: str, known_
         return
     profile = res.json()
     info.company_number = profile.get("company_number", known_number)
-    info.registered_address = _format_address(profile.get("registered_office_address", {}))
+    addr = profile.get("registered_office_address", {})
+    info.registered_address = _format_address(addr)
+    info.registered_locality = addr.get("locality")
 
 
 async def _lookup_by_name(client, auth, info: CHCompanyData, name: str):
@@ -60,8 +62,18 @@ async def _lookup_by_name(client, auth, info: CHCompanyData, name: str):
     if not items:
         return
     top = items[0]
+    found_name = top.get("title", "").upper()
+
+    # Reject the result if the name is completely different
+    from difflib import SequenceMatcher
+    if SequenceMatcher(None, name.upper(), found_name).ratio() < 0.8:
+        logger.warning(f"CH name search result '{found_name}' is too different from requested '{name}'")
+        return
+
     info.company_number = top.get("company_number")
-    info.registered_address = _format_address(top.get("address", {}))
+    addr = top.get("address", {})
+    info.registered_address = _format_address(addr)
+    info.registered_locality = addr.get("locality")
 
 
 async def _fetch_active_directors(client, auth, company_number: str) -> list:
@@ -77,4 +89,5 @@ async def _fetch_active_directors(client, auth, company_number: str) -> list:
 
 
 def _format_address(addr: dict) -> str:
-    return ", ".join(addr.get(k) for k in ("address_line_1", "locality", "postal_code") if addr.get(k))
+    keys = ("premises", "address_line_1", "address_line_2", "locality", "postal_code")
+    return ", ".join(addr.get(k) for k in keys if addr.get(k))

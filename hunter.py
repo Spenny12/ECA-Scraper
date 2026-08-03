@@ -76,12 +76,18 @@ async def _find_one(client, domain, ch_name, api_key):
     )
 
 
+import re
+
 def _split_ch_name(ch_name: str):
     """Companies House officer names come as 'SURNAME, First Middle...'.
     Splits that into (first_name, last_name) for Hunter's Email Finder,
     which wants the two separately."""
     if not ch_name:
         return None, None
+
+    # Strip common titles before processing
+    ch_name = re.sub(r'^(Mr|Mrs|Miss|Ms|Dr|Sir|Lord)\.?\s+', '', ch_name, flags=re.IGNORECASE)
+
     if "," in ch_name:
         last, _, rest = ch_name.partition(",")
         rest = rest.strip()

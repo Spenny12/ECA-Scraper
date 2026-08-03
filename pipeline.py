@@ -34,14 +34,19 @@ async def execute_full_pipeline(job_id, file_bytes, filename, serper_api_key, ch
             )
 
         async with httpx.AsyncClient(timeout=30.0) as client:
-            domains = await serper.discover_domains(job, client, company_names, serper_api_key) if serper_api_key else []
             # company_metadata carries known Companies House numbers (from
             # the source sheet), used for exact lookups instead of a fuzzy
             # name search that can match the wrong company.
             ch_data = await companies_house.enrich_companies(job, client, company_names, company_metadata, ch_api_key) if ch_api_key else []
-
-            dom_map = {d.provided_name: d.discovered_domain for d in domains}
             ch_map = {c.company_name: c for c in ch_data}
+
+            # CH's registered locality (town/city) is used to geo-target the
+            # domain search and disambiguate same-named companies in
+            # different countries (see serper.py's module docstring).
+            locality_map = {name: c.registered_locality for name, c in ch_map.items() if c.registered_locality}
+            domains = await serper.discover_domains(job, client, company_names, serper_api_key, locality_map) if serper_api_key else []
+            dom_map = {d.provided_name: d.discovered_domain for d in domains}
+
             # Hunter is targeted at the specific directors Companies House
             # returned, so it needs both maps rather than just the domain list.
             contacts_by_company = (

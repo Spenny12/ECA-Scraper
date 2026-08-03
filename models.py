@@ -29,6 +29,7 @@ class CHCompanyData(BaseModel):
     company_name: str
     company_number: Optional[str] = None
     registered_address: Optional[str] = None
+    registered_locality: Optional[str] = None
     directors: List[Dict[str, str]] = []
 
 
