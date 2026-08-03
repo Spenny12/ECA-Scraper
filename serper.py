@@ -28,7 +28,7 @@ from urllib.parse import urlparse
 from config import logger
 from models import DomainInfo
 
-EXCLUDED_HOST_FRAGMENTS = ('.gov.uk', '.linkedin.com', 'companieshouse', 'endole', 'yell', 'zoominfo')
+EXCLUDED_HOST_FRAGMENTS = ('.gov.uk', '.linkedin.com', 'companieshouse', 'endole', 'yell', 'zoominfo', '.gov', '.ac', '.nhs.uk', '.police.uk')
 IGNORED_NAME_TOKENS = {'limited', 'ltd', 'uk', 'plc', 'group', 'co', 'and'}
 
 # Country-code TLDs that indicate the site is very unlikely to be a UK
