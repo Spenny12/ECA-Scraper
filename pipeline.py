@@ -16,6 +16,7 @@ import companies_house
 import hunter
 import serper
 import store
+from hunter import split_ch_name
 from config import MAX_COMPANIES_PER_UPLOAD, logger
 
 PROPRIETOR_NAME_COL_RE = re.compile(r'^Proprietor Name \(\d+\)$', re.IGNORECASE)
@@ -98,9 +99,32 @@ def _read_sheet(file_contents: bytes, filename: str) -> pd.DataFrame:
 def _derive_purchase_year(df: pd.DataFrame) -> pd.Series:
     if 'Date Proprietor Added' not in df.columns:
         return pd.Series('Unknown', index=df.index)
-    # Land Registry dates are Excel serial day numbers.
-    years = pd.to_datetime(pd.to_numeric(df['Date Proprietor Added'], errors='coerce'), unit='D', origin='1899-12-30').dt.year
-    return years.astype('Int64').astype(str).replace('<NA>', 'Unknown')
+
+    raw = df['Date Proprietor Added']
+
+    # Land Registry CSV exports store this as a UK-format text date
+    # (e.g. "9/9/2024" or "28-09-2018", day-first, mixed separators) -
+    # format='mixed' is required or pandas' batch parser bails out on the
+    # whole column as soon as it hits an inconsistent separator. Excel
+    # exports of the same data can instead serialize it as a numeric day
+    # count, so anything that doesn't parse as a text date falls back to
+    # that interpretation.
+    parsed = pd.to_datetime(raw, dayfirst=True, format='mixed', errors='coerce')
+
+    still_missing = parsed.isna()
+    if still_missing.any():
+        serial = pd.to_datetime(
+            pd.to_numeric(raw[still_missing], errors='coerce'),
+            unit='D', origin='1899-12-30', errors='coerce'
+        )
+        parsed.loc[still_missing] = serial
+
+    years = parsed.dt.year
+    # .astype('string') (nullable StringDtype) is required here - plain
+    # .astype(str) on a nullable Int64 column stringifies missing values
+    # as the literal text "NaN" instead of pd.NA, which silently defeats
+    # a NaN-string replace() and is why "nan" was leaking into the output.
+    return years.astype('Int64').astype('string').fillna('Unknown')
 
 
 def _extract_companies(df: pd.DataFrame, proprietor_cols: list, generic_col: str) -> dict:
@@ -157,7 +181,19 @@ def _rows_for_company(name, dom_map, conf_map, contacts_by_company, ch_map, comp
     ch = ch_map.get(name)
     meta = company_metadata.get(name, {})
 
-    director = ch.directors[0]["name"] if (ch and ch.directors) else "UNIDENTIFIED"
+    if ch and ch.directors:
+        # CH officer names come as "SURNAME, First Middle" - split_ch_name
+        # (shared with hunter.py's Hunter lookups) turns that into a normal
+        # "First Last" display order instead of showing the raw CH format.
+        director_first, director_last = split_ch_name(ch.directors[0]["name"])
+        if not director_first:
+            # Name didn't fit the expected pattern (e.g. a single word) -
+            # fall back to showing it as-is rather than dropping it.
+            director_first, director_last = ch.directors[0]["name"], ""
+    else:
+        director_first, director_last = "UNIDENTIFIED", ""
+    director = f"{director_first} {director_last}".strip()
+
     base = {
         "Target Company Name": name,
         "Property Address": meta.get('Property Address', 'your property'),
@@ -174,23 +210,28 @@ def _rows_for_company(name, dom_map, conf_map, contacts_by_company, ch_map, comp
             # no generic-inbox fallback needed.
             person = f"{e.first_name} {e.last_name}"
             rows.append({**base, "Discovered Domain": domain, "Domain Match Confidence": confidence,
-                         "Employee Name": person, "Employee Position": e.position or "Director",
+                         "Employee Name": person, "Employee Forename": e.first_name, "Employee Surname": e.last_name,
+                         "Employee Position": e.position or "Director",
                          "Employee Email": e.email, "Status": "Complete (Email Found)"})
         return rows
     if domain and ch and ch.directors:
         return [{**base, "Discovered Domain": domain, "Domain Match Confidence": confidence,
-                  "Employee Name": director, "Employee Position": "Director (CH)",
+                  "Employee Name": director, "Employee Forename": director_first, "Employee Surname": director_last,
+                  "Employee Position": "Director (CH)",
                   "Employee Email": "NONE FOUND (Hunter)", "Status": "Domain Found (No Director Email)"}]
     if domain:
         return [{**base, "Discovered Domain": domain, "Domain Match Confidence": confidence,
-                  "Employee Name": director, "Employee Position": "N/A",
+                  "Employee Name": director, "Employee Forename": director_first, "Employee Surname": director_last,
+                  "Employee Position": "N/A",
                   "Employee Email": "NONE FOUND (No CH Directors)", "Status": "Domain Found (No CH Directors)"}]
     if ch and ch.directors:
         return [{**base, "Discovered Domain": "NONE FOUND (Serper)", "Domain Match Confidence": None,
-                  "Employee Name": director, "Employee Position": "Director (CH)",
+                  "Employee Name": director, "Employee Forename": director_first, "Employee Surname": director_last,
+                  "Employee Position": "Director (CH)",
                   "Employee Email": "NONE FOUND (SPV)", "Status": "SPV Fallback (CH)"}]
     return [{**base, "Discovered Domain": "NONE FOUND (Serper)", "Domain Match Confidence": None,
-              "Employee Name": director, "Employee Position": "N/A",
+              "Employee Name": director, "Employee Forename": director_first, "Employee Surname": director_last,
+              "Employee Position": "N/A",
               "Employee Email": "NONE FOUND", "Status": "Not Found"}]
 
 

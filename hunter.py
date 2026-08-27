@@ -42,7 +42,7 @@ async def discover_director_emails(job, client, company_names, dom_map, ch_map, 
 
 
 async def _find_one(client, domain, ch_name, api_key):
-    first_name, last_name = _split_ch_name(ch_name)
+    first_name, last_name = split_ch_name(ch_name)
     if not first_name or not last_name:
         logger.warning(f"Could not parse director name '{ch_name}' into first/last - skipping Hunter lookup")
         return None
@@ -78,10 +78,11 @@ async def _find_one(client, domain, ch_name, api_key):
 
 import re
 
-def _split_ch_name(ch_name: str):
+def split_ch_name(ch_name: str):
     """Companies House officer names come as 'SURNAME, First Middle...'.
-    Splits that into (first_name, last_name) for Hunter's Email Finder,
-    which wants the two separately."""
+    Splits that into (first_name, last_name) - used both for Hunter's
+    Email Finder (which wants the two separately) and by pipeline.py to
+    display director names as "First Last" instead of CH's raw format."""
     if not ch_name:
         return None, None
 
