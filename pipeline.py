@@ -131,7 +131,7 @@ def _extract_companies(df: pd.DataFrame, proprietor_cols: list, generic_col: str
     company_metadata = {}   # normalized (upper) name -> metadata
     display_name = {}       # normalized name -> original-cased name
 
-    def add(name, reg_no, prop_addr, purch_year):
+    def add(name, reg_no, prop_addr, purch_year, price_paid):
         name = str(name).strip()
         if not name or name.lower() == 'nan':
             return
@@ -143,21 +143,23 @@ def _extract_companies(df: pd.DataFrame, proprietor_cols: list, generic_col: str
         company_metadata[key] = {
             'Property Address': prop_addr,
             'Purchase Year': purch_year,
+            'Price Paid': price_paid,
             'company_number': clean_reg_no,
         }
 
     for _, row in df.iterrows():
         prop_addr = str(row.get('Property Address', 'your property'))
         purch_year = str(row.get('Purchase Year', 'recently'))
+        price_paid = str(row.get('Price Paid', 'Unknown'))
         if proprietor_cols:
             for name_col in proprietor_cols:
                 idx_match = re.search(r'\((\d+)\)$', name_col.strip())
                 idx = idx_match.group(1) if idx_match else '1'
                 reg_no_col = f'Company Registration No. ({idx})'
                 reg_no = row.get(reg_no_col) if reg_no_col in df.columns else None
-                add(row.get(name_col), reg_no, prop_addr, purch_year)
+                add(row.get(name_col), reg_no, prop_addr, purch_year, price_paid)
         else:
-            add(row.get(generic_col), None, prop_addr, purch_year)
+            add(row.get(generic_col), None, prop_addr, purch_year, price_paid)
 
     return {display_name[key]: meta for key, meta in company_metadata.items()}
 
@@ -198,6 +200,7 @@ def _rows_for_company(name, dom_map, conf_map, contacts_by_company, ch_map, comp
         "Target Company Name": name,
         "Property Address": meta.get('Property Address', 'your property'),
         "Purchase Year": meta.get('Purchase Year', 'recently'),
+        "Price Paid": meta.get('Price Paid', 'Unknown'),
         "Companies House Number": ch.company_number if ch else "NOT FOUND",
         "Registered Address": ch.registered_address if ch else "NOT FOUND",
     }
