@@ -12,7 +12,7 @@ re-running a sync after a re-enrichment just updates the same records rather
 than creating duplicates.
 
 Custom properties (prefixed `eca_` to avoid clashing with anything else in
-the portal): eca_property_address, eca_purchase_year, eca_company_number,
+the portal): eca_property_address, eca_purchase_date, eca_company_number,
 eca_registered_address, eca_discovered_domain, eca_lead_status.
 """
 import httpx
@@ -24,7 +24,7 @@ BATCH_SIZE = 100  # HubSpot's batch upsert max per request
 
 CUSTOM_PROPERTIES = [
     {"name": "eca_property_address", "label": "ECA Property Address", "type": "string", "fieldType": "text", "groupName": "contactinformation"},
-    {"name": "eca_purchase_year", "label": "ECA Purchase Year", "type": "string", "fieldType": "text", "groupName": "contactinformation"},
+    {"name": "eca_purchase_date", "label": "ECA Purchase Date", "type": "string", "fieldType": "text", "groupName": "contactinformation"},
     {"name": "eca_company_number", "label": "ECA Companies House Number", "type": "string", "fieldType": "text", "groupName": "contactinformation"},
     {"name": "eca_registered_address", "label": "ECA Registered Address", "type": "string", "fieldType": "text", "groupName": "contactinformation"},
     {"name": "eca_discovered_domain", "label": "ECA Discovered Domain", "type": "string", "fieldType": "text", "groupName": "contactinformation"},
@@ -66,18 +66,23 @@ def _row_to_contact(row: dict) -> dict | None:
     else:
         first_name, last_name = "", ""
 
-    return {
+    contact = {
         "email": email,
         "firstname": first_name,
         "lastname": last_name,
         "company": row.get("Target Company Name", ""),
         "eca_property_address": row.get("Property Address", ""),
-        "eca_purchase_year": str(row.get("Purchase Year", "")),
+        "eca_purchase_date": str(row.get("Purchase Date", "")),
         "eca_company_number": row.get("Companies House Number", ""),
         "eca_registered_address": row.get("Registered Address", ""),
         "eca_discovered_domain": row.get("Discovered Domain", ""),
         "eca_lead_status": row.get("Status", ""),
     }
+    # Only sent when present - an empty value would wipe a phone number
+    # already on the HubSpot contact.
+    if row.get("Phone Number"):
+        contact["phone"] = row["Phone Number"]
+    return contact
 
 
 async def sync_results_to_hubspot(results: list) -> dict:

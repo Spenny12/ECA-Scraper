@@ -14,11 +14,12 @@ import pandas as pd
 from fastapi import HTTPException
 
 import companies_house
+import fullenrich
 import hunter
 import serper
 import store
 from hunter import split_ch_name
-from config import MAX_COMPANIES_PER_UPLOAD, logger
+from config import FULLENRICH_API_KEY, MAX_COMPANIES_PER_UPLOAD, logger
 
 PROPRIETOR_NAME_COL_RE = re.compile(r'^Proprietor Name \(\d+\)$', re.IGNORECASE)
 GENERIC_NAME_COLS = ('Recipient Name', 'company_name', 'company', 'name')
@@ -55,7 +56,13 @@ async def execute_full_pipeline(job_id, file_bytes, filename, serper_api_key, ch
                 await hunter.discover_director_emails(job, client, company_names, dom_map, ch_map, hunter_api_key, max_directors)
                 if hunter_api_key else {}
             )
-            job.final_combined_results = combine_results(company_names, domains, contacts_by_company, ch_data, company_metadata)
+            results = combine_results(company_names, domains, contacts_by_company, ch_data, company_metadata)
+
+            # Runs last because it needs Hunter's results - contacts that
+            # already have an email only get a phone lookup.
+            if FULLENRICH_API_KEY:
+                await fullenrich.enrich_rows(job, client, results, FULLENRICH_API_KEY)
+            job.final_combined_results = results
     except Exception as e:
         logger.error(f"Pipeline error {job_id}: {e}")
         job.status = "Error"
@@ -73,7 +80,7 @@ def preprocess_uploaded_file(job, file_contents: bytes, filename: str):
     """Parses the upload and returns (company_names, company_metadata).
 
     company_metadata maps each company name -> {Property Address, Purchase
-    Year, company_number}. Land Registry-style exports list up to four
+    Date, Price Paid, company_number}. Land Registry-style exports list up to four
     proprietors per title, each with its own registration number, so those
     are all extracted as separate leads rather than just the first one.
     """
@@ -84,7 +91,7 @@ def preprocess_uploaded_file(job, file_contents: bytes, filename: str):
     if not proprietor_cols and not generic_col:
         raise HTTPException(status_code=400, detail="Company column not found.")
 
-    df['Purchase Year'] = _derive_purchase_year(df)
+    df['Purchase Date'] = _derive_purchase_date(df)
 
     company_metadata = _extract_companies(df, proprietor_cols, generic_col)
     names = list(company_metadata.keys())
@@ -101,7 +108,7 @@ def _read_sheet(file_contents: bytes, filename: str) -> pd.DataFrame:
     return pd.read_excel(io.BytesIO(file_contents))
 
 
-def _derive_purchase_year(df: pd.DataFrame) -> pd.Series:
+def _derive_purchase_date(df: pd.DataFrame) -> pd.Series:
     if 'Date Proprietor Added' not in df.columns:
         return pd.Series('Unknown', index=df.index)
 
@@ -124,19 +131,16 @@ def _derive_purchase_year(df: pd.DataFrame) -> pd.Series:
         )
         parsed.loc[still_missing] = serial
 
-    years = parsed.dt.year
-    # .astype('string') (nullable StringDtype) is required here - plain
-    # .astype(str) on a nullable Int64 column stringifies missing values
-    # as the literal text "NaN" instead of pd.NA, which silently defeats
-    # a NaN-string replace() and is why "nan" was leaking into the output.
-    return years.astype('Int64').astype('string').fillna('Unknown')
+    # Normalised to UK dd/mm/yyyy whichever format it came in as. strftime
+    # leaves NaT as NaN, so fillna catches dates that didn't parse at all.
+    return parsed.dt.strftime('%d/%m/%Y').fillna('Unknown')
 
 
 def _extract_companies(df: pd.DataFrame, proprietor_cols: list, generic_col: str) -> dict:
     company_metadata = {}   # normalized (upper) name -> metadata
     display_name = {}       # normalized name -> original-cased name
 
-    def add(name, reg_no, prop_addr, purch_year, price_paid):
+    def add(name, reg_no, prop_addr, purch_date, price_paid):
         name = str(name).strip()
         if not name or name.lower() == 'nan':
             return
@@ -147,14 +151,14 @@ def _extract_companies(df: pd.DataFrame, proprietor_cols: list, generic_col: str
         clean_reg_no = str(reg_no).strip() if reg_no not in (None, '') and str(reg_no).lower() != 'nan' else None
         company_metadata[key] = {
             'Property Address': prop_addr,
-            'Purchase Year': purch_year,
+            'Purchase Date': purch_date,
             'Price Paid': price_paid,
             'company_number': clean_reg_no,
         }
 
     for _, row in df.iterrows():
         prop_addr = str(row.get('Property Address', 'your property'))
-        purch_year = str(row.get('Purchase Year', 'recently'))
+        purch_date = str(row.get('Purchase Date', 'Unknown'))
         price_paid = str(row.get('Price Paid', 'Unknown'))
         if proprietor_cols:
             for name_col in proprietor_cols:
@@ -162,9 +166,9 @@ def _extract_companies(df: pd.DataFrame, proprietor_cols: list, generic_col: str
                 idx = idx_match.group(1) if idx_match else '1'
                 reg_no_col = f'Company Registration No. ({idx})'
                 reg_no = row.get(reg_no_col) if reg_no_col in df.columns else None
-                add(row.get(name_col), reg_no, prop_addr, purch_year, price_paid)
+                add(row.get(name_col), reg_no, prop_addr, purch_date, price_paid)
         else:
-            add(row.get(generic_col), None, prop_addr, purch_year, price_paid)
+            add(row.get(generic_col), None, prop_addr, purch_date, price_paid)
 
     return {display_name[key]: meta for key, meta in company_metadata.items()}
 
@@ -204,7 +208,7 @@ def _rows_for_company(name, dom_map, conf_map, contacts_by_company, ch_map, comp
     base = {
         "Target Company Name": name,
         "Property Address": meta.get('Property Address', 'your property'),
-        "Purchase Year": meta.get('Purchase Year', 'recently'),
+        "Purchase Date": meta.get('Purchase Date', 'Unknown'),
         "Price Paid": meta.get('Price Paid', 'Unknown'),
         "Companies House Number": ch.company_number if ch else "NOT FOUND",
         "Registered Address": ch.registered_address if ch else "NOT FOUND",
@@ -243,8 +247,19 @@ def _rows_for_company(name, dom_map, conf_map, contacts_by_company, ch_map, comp
               "Employee Email": "NONE FOUND", "Status": "Not Found"}]
 
 
+# Column order of the exported sheet. Pipeline / Pipeline Stage are left
+# blank for filling in during the HubSpot import.
+CSV_COLUMNS = [
+    "Target Company Name", "Property Address", "Purchase Date", "Price Paid",
+    "Companies House Number", "Registered Address", "Discovered Domain",
+    "Domain Match Confidence", "Employee Name", "Employee Forename",
+    "Employee Surname", "Employee Position", "Employee Email", "Status",
+    "Phone Number", "Pipeline", "Pipeline Stage",
+]
+
+
 def results_to_csv_bytes(results: list) -> bytes:
     """Serializes a job's final_combined_results into CSV bytes for export
     (and manual import into HubSpot)."""
-    df = pd.DataFrame(results)
+    df = pd.DataFrame(results).reindex(columns=CSV_COLUMNS)
     return df.to_csv(index=False).encode('utf-8')
