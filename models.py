@@ -43,13 +43,3 @@ class PipelineJob(BaseModel):
     total_emails_found_count: int = 0
     final_combined_results: List[Dict[str, Any]] = []
 
-
-class BulkEmailJob(BaseModel):
-    id: str
-    status: str
-    created_at: float
-    updated_at: float
-    total_contacts_uploaded: int = 0
-    emails_sent_count: int = 0
-    emails_skipped_count: int = 0
-    errors: List[str] = []

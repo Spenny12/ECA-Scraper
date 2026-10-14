@@ -244,8 +244,7 @@ def _rows_for_company(name, dom_map, conf_map, contacts_by_company, ch_map, comp
 
 
 def results_to_csv_bytes(results: list) -> bytes:
-    """Serializes a job's final_combined_results into CSV bytes with the
-    exact column headers /bulk-send/ expects, so the export can be fed
-    straight back in without editing."""
+    """Serializes a job's final_combined_results into CSV bytes for export
+    (and manual import into HubSpot)."""
     df = pd.DataFrame(results)
     return df.to_csv(index=False).encode('utf-8')

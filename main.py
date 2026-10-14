@@ -1,31 +1,28 @@
-"""ECA Pipeline & Sender API - routes and wiring only.
+"""ECA Pipeline API - routes and wiring only.
 
-Tool 1 (/upload-leads/, /pipeline-status/): enriches a company/land-registry
-    sheet with domains, Companies House data, and employee emails.
-Tool 2 (/bulk-send/, /bulk-send-status/): sends a templated email to each
-    contact from a previous enrichment run.
+/upload-leads/ and /pipeline-status/ enrich a company/land-registry sheet
+with domains, Companies House data, and director emails; the results are
+exported as CSV (and imported into HubSpot, where outreach is handled).
 
-The actual logic lives in pipeline.py (Tool 1) and emailer.py (Tool 2);
-see store.py for job/blacklist storage and config.py for env/limits.
+The actual logic lives in pipeline.py; see store.py for job storage and
+config.py for env/limits.
 """
 import asyncio
-import html
 import time
 import uuid
 from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 
 import store
 from config import CH_API_KEY, MAX_UPLOAD_BYTES, SERPER_API_KEY, logger
-from emailer import execute_bulk_send
 from hubspot_sync import sync_results_to_hubspot
-from models import BulkEmailJob, PipelineJob
+from models import PipelineJob
 from pipeline import execute_full_pipeline, results_to_csv_bytes
 
-app = FastAPI(title="ECA Pipeline & Sender API", description="Lead Enrichment & Bulk Email Sender")
+app = FastAPI(title="ECA Pipeline API", description="Lead Enrichment")
 
 # NOTE: this API has no authentication and CORS is wide open. That's an
 # accepted tradeoff for this deployment - it only runs behind an
@@ -77,26 +74,6 @@ async def root():
     return {"message": "ECA API is operational."}
 
 
-@app.get("/unsubscribe", response_class=HTMLResponse)
-async def unsubscribe(email: str):
-    if not email:
-        return "Invalid request."
-    store.add_to_blacklist(email)
-    logger.info(f"Unsubscribed: {email}")
-    # Escape before interpolating into HTML - `email` is attacker-controlled
-    # query input.
-    safe_email = html.escape(email)
-    return f"""
-    <html>
-        <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-            <h2>Unsubscribed Successfully</h2>
-            <p><b>{safe_email}</b> has been securely removed from our mailing list.</p>
-        </body>
-    </html>
-    """
-
-
-# --- TOOL 1: THE DATA ENRICHER ---
 @app.post("/upload-leads/", response_model=PipelineJob)
 async def upload_leads_csv_start_pipeline(
     file: UploadFile = File(...),
@@ -160,37 +137,6 @@ async def sync_pipeline_results_to_hubspot(job_id: str):
         return await sync_results_to_hubspot(job.final_combined_results)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-
-
-# --- TOOL 2: THE BULK SENDER ---
-@app.post("/bulk-send/", response_model=BulkEmailJob)
-async def bulk_send_emails(
-    file: UploadFile = File(...),
-    smtp_user: str = Form(...),
-    smtp_pass: str = Form(...),
-    email_subject: str = Form(...),
-    email_body: str = Form(...),
-    background_tasks: BackgroundTasks = BackgroundTasks()
-):
-    file_bytes = await file.read()
-    _validate_upload(file, file_bytes)
-
-    job_id = f"email_job_{uuid.uuid4().hex[:8]}"
-    new_job = BulkEmailJob(id=job_id, status="Processing", created_at=time.time(), updated_at=time.time())
-    store.email_jobs[job_id] = new_job
-    store.purge_stale_jobs()
-
-    background_tasks.add_task(
-        execute_bulk_send, job_id, file_bytes, file.filename, smtp_user, smtp_pass, email_subject, email_body
-    )
-    return new_job
-
-
-@app.get("/bulk-send-status/{job_id}", response_model=BulkEmailJob)
-async def get_bulk_send_status(job_id: str):
-    if job_id not in store.email_jobs:
-        raise HTTPException(status_code=404, detail="Email Job not found.")
-    return store.email_jobs[job_id]
 
 
 if __name__ == "__main__":
