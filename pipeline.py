@@ -4,6 +4,7 @@ Reads an uploaded sheet, discovers each company's domain (Serper), pulls its
 Companies House record, finds named employee emails at the domain (Hunter),
 and combines it all into one row-per-contact result set.
 """
+import asyncio
 import io
 import re
 import time
@@ -62,6 +63,10 @@ async def execute_full_pipeline(job_id, file_bytes, filename, serper_api_key, ch
         if job.status != "Error":
             job.status = "Complete"
         job.updated_at = time.time()
+        # Copied off-box so the result outlives a Render spin-down - see
+        # store.py. Errors are persisted too, so the UI shows "Failed"
+        # rather than "Expired" after a restart.
+        await asyncio.to_thread(store.persist_pipeline_job, job)
 
 
 def preprocess_uploaded_file(job, file_contents: bytes, filename: str):

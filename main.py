@@ -42,11 +42,24 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def _start_job_cleanup_loop():
+    await asyncio.to_thread(store.ensure_jobs_bucket)
+
     async def loop():
         while True:
-            await asyncio.sleep(60 * 60)  # hourly
+            # Runs once at startup too - on Render's free tier the instance
+            # rarely stays up a full hour, so persisted jobs would otherwise
+            # never get purged.
             store.purge_stale_jobs()
+            await asyncio.to_thread(store.purge_persisted_jobs)
+            await asyncio.sleep(60 * 60)  # hourly
     asyncio.create_task(loop())
+
+
+async def _get_pipeline_job_or_404(job_id: str) -> PipelineJob:
+    job = await asyncio.to_thread(store.get_pipeline_job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return job
 
 
 def _validate_upload(file: UploadFile, file_bytes: bytes):
@@ -92,11 +105,15 @@ async def upload_leads_csv_start_pipeline(
     # Email Finder lookup attempted (1 Hunter credit per director, whether
     # or not an email is found) - it is NOT a guaranteed number of emails
     # returned. See hunter.py's discover_director_emails for details.
-    max_directors_per_company: int = Form(4),
+    max_directors_per_company: Optional[int] = Form(None),
+    # The frontend sends the same setting under this name - accepted as an
+    # alias so its "Max contacts per domain" field actually takes effect.
+    max_contacts_per_domain: Optional[int] = Form(None),
     background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     file_bytes = await file.read()
     _validate_upload(file, file_bytes)
+    max_directors = max_directors_per_company or max_contacts_per_domain or 4
 
     job_id = f"eca_job_{uuid.uuid4().hex[:8]}"
     new_job = PipelineJob(id=job_id, status="Processing", created_at=time.time(), updated_at=time.time())
@@ -105,23 +122,19 @@ async def upload_leads_csv_start_pipeline(
 
     background_tasks.add_task(
         execute_full_pipeline, job_id, file_bytes, file.filename,
-        SERPER_API_KEY, CH_API_KEY, hunter_api_key, max_directors_per_company
+        SERPER_API_KEY, CH_API_KEY, hunter_api_key, max_directors
     )
     return new_job
 
 
 @app.get("/pipeline-status/{job_id}", response_model=PipelineJob)
 async def get_pipeline_job_status(job_id: str):
-    if job_id not in store.pipeline_jobs:
-        raise HTTPException(status_code=404, detail="Job not found.")
-    return store.pipeline_jobs[job_id]
+    return await _get_pipeline_job_or_404(job_id)
 
 
 @app.get("/pipeline-results/{job_id}/export")
 async def export_pipeline_results_csv(job_id: str):
-    if job_id not in store.pipeline_jobs:
-        raise HTTPException(status_code=404, detail="Job not found.")
-    job = store.pipeline_jobs[job_id]
+    job = await _get_pipeline_job_or_404(job_id)
     if job.status != "Complete":
         raise HTTPException(status_code=409, detail=f"Job is not complete yet (status: {job.status}).")
     if not job.final_combined_results:
@@ -137,9 +150,7 @@ async def export_pipeline_results_csv(job_id: str):
 
 @app.post("/pipeline-results/{job_id}/sync-hubspot")
 async def sync_pipeline_results_to_hubspot(job_id: str):
-    if job_id not in store.pipeline_jobs:
-        raise HTTPException(status_code=404, detail="Job not found.")
-    job = store.pipeline_jobs[job_id]
+    job = await _get_pipeline_job_or_404(job_id)
     if job.status != "Complete":
         raise HTTPException(status_code=409, detail=f"Job is not complete yet (status: {job.status}).")
     if not job.final_combined_results:
