@@ -148,7 +148,7 @@ def _extract_companies(df: pd.DataFrame, proprietor_cols: list, generic_col: str
         if key in company_metadata:
             return  # already captured this company (case-insensitive)
         display_name[key] = name
-        clean_reg_no = str(reg_no).strip() if reg_no not in (None, '') and str(reg_no).lower() != 'nan' else None
+        clean_reg_no = _normalise_company_number(reg_no)
         company_metadata[key] = {
             'Property Address': prop_addr,
             'Purchase Date': purch_date,
@@ -171,6 +171,23 @@ def _extract_companies(df: pd.DataFrame, proprietor_cols: list, generic_col: str
             add(row.get(generic_col), None, prop_addr, purch_date, price_paid)
 
     return {display_name[key]: meta for key, meta in company_metadata.items()}
+
+
+def _normalise_company_number(reg_no):
+    """Restores the leading zeros that spreadsheets strip from Companies
+    House numbers (e.g. 203669 -> 00203669) - CH numbers are always 8
+    characters, and the exact-number lookup fails without them. Prefixed
+    numbers like SC123456 or OC301234 are left alone."""
+    if reg_no is None:
+        return None
+    text = str(reg_no).strip()
+    if not text or text.lower() == 'nan':
+        return None
+    # A registration column with blanks in it is read as floats by pandas,
+    # so "203669" can arrive as "203669.0".
+    if text.endswith('.0') and text[:-2].isdigit():
+        text = text[:-2]
+    return text.zfill(8) if text.isdigit() else text.upper()
 
 
 def combine_results(company_names, domains, contacts_by_company, ch_data, company_metadata) -> list:
