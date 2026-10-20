@@ -3,7 +3,7 @@ import { useState, type DragEvent, type FormEvent } from "react";
 const ALLOWED_EXTENSIONS = [".csv", ".xlsx", ".xls"];
 const MAX_UPLOAD_MB = 15; // mirrors config.py MAX_UPLOAD_BYTES
 const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
-const MAX_COMPANIES = 3000; // mirrors config.py MAX_COMPANIES_PER_UPLOAD
+const MAX_COMPANIES = 6000; // mirrors config.py MAX_COMPANIES_PER_UPLOAD
 
 export interface ConfigPanelSubmitValues {
   file: File;

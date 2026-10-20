@@ -3,7 +3,7 @@
 For catching up on phone numbers (e.g. after FullEnrich credits ran out
 mid-run) without re-running the whole pipeline. Uses the same rules as the
 pipeline's FullEnrich step (see fullenrich.py): only rows with a domain match
-confidence above FULLENRICH_MIN_CONFIDENCE and a named director, phone-only
+confidence of at least FULLENRICH_MIN_CONFIDENCE and a named director, phone-only
 lookups where an email is already known, and email + phone otherwise. Rows
 that already have a phone number are skipped, and the same person at the
 same domain is only looked up once.

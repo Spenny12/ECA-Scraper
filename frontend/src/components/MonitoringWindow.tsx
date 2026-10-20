@@ -123,7 +123,7 @@ export default function MonitoringWindow({ jobId, onStartNewRun }: MonitoringWin
       {displayStatus === "Failed" && (
         <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
           The pipeline hit an error while processing this file. This usually means the column headers
-          didn't match the expected format, or the file has more than 3,000 companies (the per-run limit).
+          didn't match the expected format, or the file has more than 6,000 companies (the per-run limit).
           Check the file and try again.
         </p>
       )}

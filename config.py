@@ -21,10 +21,10 @@ SUPABASE_JOBS_BUCKET = os.environ.get("SUPABASE_JOBS_BUCKET", "pipeline-jobs")
 # Hard caps to stop a bad/huge upload from exhausting memory or running up
 # API bills against Serper / Companies House / Hunter.
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024        # 15 MB per uploaded file
-MAX_COMPANIES_PER_UPLOAD = 3000            # rows fed into the enrichment pipeline
-# Only contacts whose domain match confidence is strictly above this are
-# sent to FullEnrich, which charges per result.
-FULLENRICH_MIN_CONFIDENCE = 0.8
+MAX_COMPANIES_PER_UPLOAD = 6000            # rows fed into the enrichment pipeline
+# Only contacts whose domain match confidence is at least this are sent to
+# FullEnrich, which charges per result.
+FULLENRICH_MIN_CONFIDENCE = 0.9
 
 # Jobs are purged after this long - from memory, and finished pipeline jobs
 # from the Supabase bucket too - to stop memory growing forever and to limit

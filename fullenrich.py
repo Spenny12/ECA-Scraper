@@ -1,6 +1,6 @@
 """Phone (and fallback email) enrichment via FullEnrich's bulk API (v2).
 
-Only rows whose discovered domain is a confident match (above
+Only rows whose discovered domain is a confident match (at least
 FULLENRICH_MIN_CONFIDENCE) and that name a specific person are sent, since
 FullEnrich charges per result (1 credit per work email, 10 per mobile).
 Rows that already have a Hunter email only ask for a phone number - Hunter's
@@ -33,7 +33,7 @@ def _has_email(row: dict) -> bool:
 def _is_eligible(row: dict) -> bool:
     confidence = row.get("Domain Match Confidence")
     return (
-        confidence is not None and confidence > FULLENRICH_MIN_CONFIDENCE
+        confidence is not None and confidence >= FULLENRICH_MIN_CONFIDENCE
         and row.get("Employee Forename") and row.get("Employee Surname")
         and row.get("Employee Name") != "UNIDENTIFIED"
     )
