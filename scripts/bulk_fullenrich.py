@@ -36,7 +36,6 @@ import fullenrich  # noqa: E402
 CREDITS_URL = "https://app.fullenrich.com/api/v2/account/credits"
 PHONE_CREDITS = 10
 EMAIL_CREDITS = 1
-COPIED_FIELDS = ("Phone Number", "Employee Email", "Status")
 
 
 def _confidence(value):
@@ -52,22 +51,9 @@ def _is_eligible(row: dict) -> bool:
     return fullenrich._is_eligible({**row, "Domain Match Confidence": _confidence(row.get("Domain Match Confidence"))})
 
 
-def _person_key(row: dict) -> tuple:
-    return (
-        row["Employee Forename"].strip().lower(),
-        row["Employee Surname"].strip().lower(),
-        row["Discovered Domain"].strip().lower(),
-        fullenrich._has_email(row),
-    )
-
-
 def _group_contacts(rows: list) -> dict:
     """{first row index: [every row index for that person]} for eligible rows."""
-    groups = {}
-    for i, row in enumerate(rows):
-        if _is_eligible(row):
-            groups.setdefault(_person_key(row), []).append(i)
-    return {indices[0]: indices for indices in groups.values()}
+    return fullenrich.group_by_person(rows, [i for i, row in enumerate(rows) if _is_eligible(row)])
 
 
 def _load_state(path: Path) -> dict:
@@ -157,16 +143,12 @@ async def run(args):
         for n, enrichment_id in enumerate(state["enrichment_ids"], start=1):
             print(f"Waiting for batch {n}/{len(state['enrichment_ids'])} ({enrichment_id})...")
             for record in await fullenrich._wait_for_results(client, api_key, enrichment_id):
-                fullenrich._apply_result(job, rows, record)
-                try:
-                    first = int((record.get("custom") or {}).get("row"))
-                except (TypeError, ValueError):
+                first = fullenrich._apply_result(job, rows, record)
+                if first is None:
                     continue
                 if rows[first].get("Phone Number"):
                     phones_found += 1
-                for i in groups.get(first, [first])[1:]:
-                    for field in COPIED_FIELDS:
-                        rows[i][field] = rows[first][field]
+                fullenrich.copy_to_group(rows, groups, first)
             _write_output(columns, rows, output_path)
 
         print(f"Done. Phones found: {phones_found}, new emails found: {job.total_emails_found_count}")

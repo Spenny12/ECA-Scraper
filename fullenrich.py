@@ -4,7 +4,9 @@ Only rows whose discovered domain is a confident match (at least
 FULLENRICH_MIN_CONFIDENCE) and that name a specific person are sent, since
 FullEnrich charges per result (1 credit per work email, 10 per mobile).
 Rows that already have a Hunter email only ask for a phone number - Hunter's
-email is kept and FullEnrich isn't asked to find another.
+email is kept and FullEnrich isn't asked to find another. A company with
+several properties has a copy of each contact row per property, so each
+person is only looked up once and the result is copied to all their rows.
 
 FullEnrich is asynchronous: each batch of up to 100 contacts is submitted,
 then polled until it finishes. Results are matched back to rows via the
@@ -20,6 +22,9 @@ POLL_INTERVAL_SECONDS = 30  # FullEnrich's own "try again in 30 seconds"
 MAX_WAIT_SECONDS = 60 * 60  # give up on a batch after an hour
 TERMINAL_STATUSES = ("FINISHED", "CANCELED", "CREDITS_INSUFFICIENT", "UNKNOWN")
 ACCEPTED_EMAIL_STATUSES = ("DELIVERABLE", "HIGH_PROBABILITY")
+# Fields _apply_result can fill, copied from a person's looked-up row to
+# their other rows.
+ENRICHED_FIELDS = ("Phone Number", "Employee Email", "Status")
 
 
 def _headers(api_key: str) -> dict:
@@ -39,6 +44,29 @@ def _is_eligible(row: dict) -> bool:
     )
 
 
+def group_by_person(rows: list, indices) -> dict:
+    """{first row index: [every row index for that person]} - one lookup
+    per person at a domain, whatever number of rows they appear on."""
+    groups = {}
+    for i in indices:
+        row = rows[i]
+        key = (
+            str(row["Employee Forename"]).strip().lower(),
+            str(row["Employee Surname"]).strip().lower(),
+            str(row["Discovered Domain"]).strip().lower(),
+            _has_email(row),
+        )
+        groups.setdefault(key, []).append(i)
+    return {indices[0]: indices for indices in groups.values()}
+
+
+def copy_to_group(rows: list, groups: dict, first: int):
+    for i in groups.get(first, [first])[1:]:
+        for field in ENRICHED_FIELDS:
+            if field in rows[first]:
+                rows[i][field] = rows[first][field]
+
+
 def _to_contact(index: int, row: dict) -> dict:
     enrich_fields = ["contact.phones"] if _has_email(row) else ["contact.work_emails", "contact.phones"]
     return {
@@ -54,7 +82,8 @@ def _to_contact(index: int, row: dict) -> dict:
 async def enrich_rows(job, client, rows: list, api_key: str):
     """Fills in "Phone Number" (and "Employee Email" where Hunter found
     none) on eligible rows, in place."""
-    contacts = [_to_contact(i, row) for i, row in enumerate(rows) if _is_eligible(row)]
+    groups = group_by_person(rows, [i for i, row in enumerate(rows) if _is_eligible(row)])
+    contacts = [_to_contact(i, rows[i]) for i in groups]
     if not contacts:
         return
     logger.info(f"FullEnrich: enriching {len(contacts)} contact(s) for job {job.id}")
@@ -70,7 +99,9 @@ async def enrich_rows(job, client, rows: list, api_key: str):
     # before waiting on any of them.
     for enrichment_id in enrichment_ids:
         for record in await _wait_for_results(client, api_key, enrichment_id):
-            _apply_result(job, rows, record)
+            first = _apply_result(job, rows, record)
+            if first is not None:
+                copy_to_group(rows, groups, first)
 
 
 async def _start_batch(client, api_key, name, batch):
@@ -122,10 +153,13 @@ async def _wait_for_results(client, api_key, enrichment_id) -> list:
 
 
 def _apply_result(job, rows: list, record: dict):
+    """Fills in one looked-up row; returns its index, or None if the record
+    can't be matched to a row."""
     try:
-        row = rows[int((record.get("custom") or {}).get("row"))]
+        index = int((record.get("custom") or {}).get("row"))
+        row = rows[index]
     except (TypeError, ValueError, IndexError):
-        return
+        return None
     info = record.get("contact_info") or {}
 
     phone = (info.get("most_probable_phone") or {}).get("number")
@@ -138,3 +172,4 @@ def _apply_result(job, rows: list, record: dict):
             row["Employee Email"] = work_email["email"].lower()
             row["Status"] = "Complete (Email Found)"
             job.total_emails_found_count += 1
+    return index

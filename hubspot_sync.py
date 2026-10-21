@@ -91,7 +91,14 @@ async def sync_results_to_hubspot(results: list) -> dict:
     if not HUBSPOT_ACCESS_TOKEN:
         raise ValueError("HUBSPOT_ACCESS_TOKEN is not configured.")
 
-    contacts = [c for c in (_row_to_contact(r) for r in results) if c]
+    # A contact appears once per property their company owns, but HubSpot
+    # rejects a batch containing the same email twice - so each email is
+    # only sent once, with the first property it appears against.
+    contacts, seen = [], set()
+    for contact in map(_row_to_contact, results):
+        if contact and contact["email"] not in seen:
+            seen.add(contact["email"])
+            contacts.append(contact)
     summary = {"synced": 0, "skipped": len(results) - len(contacts), "errors": []}
     if not contacts:
         return summary

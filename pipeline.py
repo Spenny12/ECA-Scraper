@@ -79,10 +79,13 @@ async def execute_full_pipeline(job_id, file_bytes, filename, serper_api_key, ch
 def preprocess_uploaded_file(job, file_contents: bytes, filename: str):
     """Parses the upload and returns (company_names, company_metadata).
 
-    company_metadata maps each company name -> {Property Address, Purchase
-    Date, Price Paid, company_number}. Land Registry-style exports list up to four
-    proprietors per title, each with its own registration number, so those
-    are all extracted as separate leads rather than just the first one.
+    company_metadata maps each company name -> {company_number, properties},
+    where properties lists every distinct {Property Address, Purchase Date,
+    Price Paid} the company appears against - each company is only enriched
+    once, but gets an output row per property. Land Registry-style exports
+    list up to four proprietors per title, each with its own registration
+    number, so those are all extracted as separate leads rather than just
+    the first one.
     """
     df = _read_sheet(file_contents, filename)
     proprietor_cols = [c for c in df.columns if PROPRIETOR_NAME_COL_RE.match(c.strip())]
@@ -144,17 +147,23 @@ def _extract_companies(df: pd.DataFrame, proprietor_cols: list, generic_col: str
         name = str(name).strip()
         if not name or name.lower() == 'nan':
             return
-        key = name.upper()
-        if key in company_metadata:
-            return  # already captured this company (case-insensitive)
-        display_name[key] = name
-        clean_reg_no = _normalise_company_number(reg_no)
-        company_metadata[key] = {
-            'Property Address': prop_addr,
-            'Purchase Date': purch_date,
-            'Price Paid': price_paid,
-            'company_number': clean_reg_no,
-        }
+        key = name.upper()  # case-insensitive, so each company is enriched once
+        if key not in company_metadata:
+            display_name[key] = name
+            company_metadata[key] = {'company_number': None, 'properties': [], '_seen': set()}
+        meta = company_metadata[key]
+        if not meta['company_number']:
+            meta['company_number'] = _normalise_company_number(reg_no)
+        # The same title can be listed more than once (e.g. on separate rows
+        # per proprietor), so a property is only kept once per company.
+        prop_key = (prop_addr.strip().upper(), purch_date)
+        if prop_key not in meta['_seen']:
+            meta['_seen'].add(prop_key)
+            meta['properties'].append({
+                'Property Address': prop_addr,
+                'Purchase Date': purch_date,
+                'Price Paid': price_paid,
+            })
 
     for _, row in df.iterrows():
         prop_addr = str(row.get('Property Address', 'your property'))
@@ -170,7 +179,10 @@ def _extract_companies(df: pd.DataFrame, proprietor_cols: list, generic_col: str
         else:
             add(row.get(generic_col), None, prop_addr, purch_date, price_paid)
 
-    return {display_name[key]: meta for key, meta in company_metadata.items()}
+    return {
+        display_name[key]: {'company_number': meta['company_number'], 'properties': meta['properties']}
+        for key, meta in company_metadata.items()
+    }
 
 
 def _normalise_company_number(reg_no):
@@ -190,6 +202,9 @@ def _normalise_company_number(reg_no):
     return text.zfill(8) if text.isdigit() else text.upper()
 
 
+DEFAULT_PROPERTY = {'Property Address': 'your property', 'Purchase Date': 'Unknown', 'Price Paid': 'Unknown'}
+
+
 def combine_results(company_names, domains, contacts_by_company, ch_data, company_metadata) -> list:
     dom_map = {r.provided_name: r.discovered_domain for r in domains}
     conf_map = {r.provided_name: r.match_confidence for r in domains}
@@ -197,17 +212,22 @@ def combine_results(company_names, domains, contacts_by_company, ch_data, compan
 
     combined = []
     for name in company_names:
-        combined.extend(_rows_for_company(name, dom_map, conf_map, contacts_by_company, ch_map, company_metadata))
+        contact_rows = _rows_for_company(name, dom_map, conf_map, contacts_by_company, ch_map)
+        # Every property the company owns gets its own copy of the contact
+        # rows - the company is only looked up once, but no property is dropped.
+        for prop in (company_metadata.get(name) or {}).get('properties') or [DEFAULT_PROPERTY]:
+            combined.extend({**row, **prop} for row in contact_rows)
     return combined
 
 
-def _rows_for_company(name, dom_map, conf_map, contacts_by_company, ch_map, company_metadata) -> list:
+def _rows_for_company(name, dom_map, conf_map, contacts_by_company, ch_map) -> list:
+    """Contact rows for one company, without the per-property fields -
+    combine_results() adds those for each property."""
     domain = dom_map.get(name)
     confidence = conf_map.get(name)
     contact_result = contacts_by_company.get(name)
     emails = contact_result.emails_found if contact_result else None
     ch = ch_map.get(name)
-    meta = company_metadata.get(name, {})
 
     if ch and ch.directors:
         # CH officer names come as "SURNAME, First Middle" - split_ch_name
@@ -224,9 +244,6 @@ def _rows_for_company(name, dom_map, conf_map, contacts_by_company, ch_map, comp
 
     base = {
         "Target Company Name": name,
-        "Property Address": meta.get('Property Address', 'your property'),
-        "Purchase Date": meta.get('Purchase Date', 'Unknown'),
-        "Price Paid": meta.get('Price Paid', 'Unknown'),
         "Companies House Number": ch.company_number if ch else "NOT FOUND",
         "Registered Address": ch.registered_address if ch else "NOT FOUND",
     }
