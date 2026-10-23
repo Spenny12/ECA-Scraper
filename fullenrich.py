@@ -13,6 +13,7 @@ then polled until it finishes. Results are matched back to rows via the
 `custom` passthrough field.
 """
 import asyncio
+import re
 
 from config import FULLENRICH_MIN_CONFIDENCE, logger
 
@@ -22,6 +23,10 @@ POLL_INTERVAL_SECONDS = 30  # FullEnrich's own "try again in 30 seconds"
 MAX_WAIT_SECONDS = 60 * 60  # give up on a batch after an hour
 TERMINAL_STATUSES = ("FINISHED", "CANCELED", "CREDITS_INSUFFICIENT", "UNKNOWN")
 ACCEPTED_EMAIL_STATUSES = ("DELIVERABLE", "HIGH_PROBABILITY")
+# FullEnrich has no mobile-only option - a phone lookup can return
+# landlines and VoIP numbers too, so anything not identified as a mobile
+# is discarded here.
+UK_MOBILE_RE = re.compile(r"^\+44\s*7[1-57-9]")  # 070 personal and 076 pager numbers aren't mobiles
 # Fields _apply_result can fill, copied from a person's looked-up row to
 # their other rows.
 ENRICHED_FIELDS = ("Phone Number", "Employee Email", "Status")
@@ -152,6 +157,25 @@ async def _wait_for_results(client, api_key, enrichment_id) -> list:
     return []
 
 
+def _is_mobile(phone: dict) -> bool:
+    number = str(phone.get("number") or "").strip()
+    if not number or phone.get("line_status") == "INACTIVE":
+        return False
+    line_type = phone.get("line_type")
+    if line_type == "MOBILE":
+        return True
+    # FullEnrich can't always tell the line type - a UK mobile prefix is
+    # still a reliable sign it's a mobile.
+    return line_type in (None, "UNKNOWN") and bool(UK_MOBILE_RE.match(number))
+
+
+def _best_mobile(info: dict):
+    """FullEnrich's most probable phone if it's a mobile, otherwise the
+    first mobile among its other candidates, otherwise None."""
+    candidates = [info.get("most_probable_phone") or {}] + list(info.get("phones") or [])
+    return next((p["number"].strip() for p in candidates if _is_mobile(p)), None)
+
+
 def _apply_result(job, rows: list, record: dict):
     """Fills in one looked-up row; returns its index, or None if the record
     can't be matched to a row."""
@@ -162,7 +186,7 @@ def _apply_result(job, rows: list, record: dict):
         return None
     info = record.get("contact_info") or {}
 
-    phone = (info.get("most_probable_phone") or {}).get("number")
+    phone = _best_mobile(info)
     if phone:
         row["Phone Number"] = phone
 
