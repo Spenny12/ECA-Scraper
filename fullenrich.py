@@ -14,6 +14,7 @@ then polled until it finishes. Results are matched back to rows via the
 """
 import asyncio
 import re
+from difflib import SequenceMatcher
 
 from config import FULLENRICH_MIN_CONFIDENCE, logger
 
@@ -176,6 +177,39 @@ def _best_mobile(info: dict):
     return next((p["number"].strip() for p in candidates if _is_mobile(p)), None)
 
 
+def _email_matches_domain(email: str, domain: str) -> bool:
+    """True if the email is at the company's discovered domain, or one
+    closely matching it. FullEnrich matches people by name, so for a common
+    name it can return the work email of a namesake at a completely
+    different company - those are rejected here."""
+    email_domain = email.rsplit("@", 1)[-1].lower().strip()
+    domain = domain.lower().strip().removeprefix("www.")
+    if not email_domain or not domain:
+        return False
+    # Same domain, or one is a subdomain of the other.
+    if email_domain == domain or email_domain.endswith("." + domain) or domain.endswith("." + email_domain):
+        return True
+    # Same brand on a different TLD or a variant spelling, e.g. starkey.com
+    # for starkey.co.uk, fastglobe.co.uk for fastglobemastics.co.uk, or
+    # swdesignandbuild.com for swdesignbuild.co.uk.
+    a, b = email_domain.split(".")[0], domain.split(".")[0]
+    if min(len(a), len(b)) >= 4 and (a in b or b in a):
+        return True
+    return SequenceMatcher(None, a, b).ratio() >= 0.8
+
+
+def _best_work_email(info: dict, domain: str):
+    """FullEnrich's most probable work email if it's usable and at the
+    company's domain, otherwise the first such email among its other
+    candidates, otherwise None."""
+    candidates = [info.get("most_probable_work_email") or {}] + list(info.get("work_emails") or [])
+    for candidate in candidates:
+        email = str(candidate.get("email") or "").strip().lower()
+        if email and candidate.get("status") in ACCEPTED_EMAIL_STATUSES and _email_matches_domain(email, domain):
+            return email
+    return None
+
+
 def _apply_result(job, rows: list, record: dict):
     """Fills in one looked-up row; returns its index, or None if the record
     can't be matched to a row."""
@@ -191,9 +225,9 @@ def _apply_result(job, rows: list, record: dict):
         row["Phone Number"] = phone
 
     if not _has_email(row):
-        work_email = info.get("most_probable_work_email") or {}
-        if work_email.get("email") and work_email.get("status") in ACCEPTED_EMAIL_STATUSES:
-            row["Employee Email"] = work_email["email"].lower()
+        email = _best_work_email(info, str(row.get("Discovered Domain", "")))
+        if email:
+            row["Employee Email"] = email
             row["Status"] = "Complete (Email Found)"
             job.total_emails_found_count += 1
     return index
