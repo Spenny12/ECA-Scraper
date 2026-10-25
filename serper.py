@@ -42,6 +42,10 @@ NON_UK_CCTLDS = {
     'no', 'dk', 'fi', 'ch', 'at', 'be', 'pt', 'gr', 'tr', 'kr', 'id', 'my',
     'ph', 'vn', 'th', 'hk', 'tw', 'sa', 'eg', 'ar', 'cl', 'co',  # .co (Colombia's cc-TLD; distinct from generic "co" token matching)
 }
+# Words commonly put in front of a company name in its domain (e.g.
+# theriverlowgroup.co.uk) - allowed before a name word without breaking the
+# match (see _starts_a_word).
+DOMAIN_PREFIX_WORDS = ('the', 'my', 'our', 'we', 'go', 'get', 'hello', 'team')
 UK_TLD_SUFFIXES = ('.co.uk', '.org.uk', '.ltd.uk', '.plc.uk', '.me.uk', '.net.uk', '.uk')
 
 NAME_SIMILARITY_WEIGHT = 0.7
@@ -119,14 +123,12 @@ def _score_candidate(item: dict, name: str, locality: str | None) -> tuple[str |
     if not tokens or not clean_dom:
         return None, 0.0
 
-    # Require that at least one distinct part of the name is in the domain
-    valid_match = False
-    for t in tokens:
-        if len(t) > 2 and t in clean_dom:
-            valid_match = True
-            break
-
-    if not valid_match:
+    # Require that at least one distinct part of the name starts a "word" in
+    # the domain - not just appears somewhere inside it, which let WINGTON
+    # ESTATES match newingtonestates.com.
+    name_words = clean_name.split()
+    label = raw_dom.split('.')[0]
+    if not any(len(t) > 2 and any(_starts_a_word(v, label, name_words) for v in _word_forms(t)) for t in tokens):
         return None, 0.0
 
     similarity = SequenceMatcher(None, ''.join(tokens), clean_dom).ratio()
@@ -146,6 +148,41 @@ def _score_candidate(item: dict, name: str, locality: str | None) -> tuple[str |
             score += LOCALITY_BONUS
 
     return raw_dom, score
+
+
+def _starts_a_word(token: str, label: str, name_words: list) -> bool:
+    """True if token appears in the domain label at the start of a word.
+    Domains run words together, so "a word starts here" means everything
+    before the token is the start of the label, a hyphen, or made up
+    entirely of other words from the company name or DOMAIN_PREFIX_WORDS:
+    "wington" starts a word in "wingtonestates", "the-wington" and
+    "thewington", but not in "newingtonestates"."""
+    for part in label.split('-'):
+        part = re.sub(r'[^a-z0-9]', '', part)
+        start = part.find(token)
+        while start != -1:
+            if _made_of_words(part[:start], name_words):
+                return True
+            start = part.find(token, start + 1)
+    return False
+
+
+def _made_of_words(text: str, name_words: list) -> bool:
+    if not text:
+        return True
+    words = {v for w in name_words for v in _word_forms(w)} | set(DOMAIN_PREFIX_WORDS)
+    return any(w and text.startswith(w) and _made_of_words(text[len(w):], name_words) for w in words)
+
+
+def _word_forms(word: str) -> set:
+    """The word plus its singular, so PROPERTIES matches "property" and
+    MARTIN'S (cleaned to "martins") matches "martin" in a domain."""
+    forms = {word}
+    if word.endswith('ies') and len(word) > 4:
+        forms.add(word[:-3] + 'y')
+    elif word.endswith('s') and len(word) > 3:
+        forms.add(word[:-1])
+    return forms
 
 
 def _tld_of(domain: str) -> str:
