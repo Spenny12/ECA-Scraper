@@ -15,11 +15,12 @@ from fastapi import HTTPException
 
 import companies_house
 import fullenrich
+import hubspot_sync
 import hunter
 import serper
 import store
 from hunter import split_ch_name
-from config import FULLENRICH_API_KEY, MAX_COMPANIES_PER_UPLOAD, logger
+from config import FULLENRICH_API_KEY, HUBSPOT_ACCESS_TOKEN, HUBSPOT_AUTO_PUSH, MAX_COMPANIES_PER_UPLOAD, logger
 
 PROPRIETOR_NAME_COL_RE = re.compile(r'^Proprietor Name \(\d+\)$', re.IGNORECASE)
 GENERIC_NAME_COLS = ('Recipient Name', 'company_name', 'company', 'name')
@@ -63,6 +64,15 @@ async def execute_full_pipeline(job_id, file_bytes, filename, serper_api_key, ch
             if FULLENRICH_API_KEY:
                 await fullenrich.enrich_rows(job, client, results, FULLENRICH_API_KEY)
             job.final_combined_results = results
+
+        if HUBSPOT_ACCESS_TOKEN and HUBSPOT_AUTO_PUSH:
+            # A HubSpot failure is recorded on the job but doesn't fail it -
+            # the results are still saved and exportable either way.
+            try:
+                job.hubspot_summary = await hubspot_sync.push_results_to_hubspot(results)
+            except Exception as e:
+                logger.error(f"HubSpot push failed for {job_id}: {e}")
+                job.hubspot_summary = {"error": str(e)}
     except Exception as e:
         logger.error(f"Pipeline error {job_id}: {e}")
         job.status = "Error"

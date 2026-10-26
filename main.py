@@ -18,7 +18,7 @@ from fastapi.responses import StreamingResponse
 
 import store
 from config import CH_API_KEY, MAX_UPLOAD_BYTES, SERPER_API_KEY, logger
-from hubspot_sync import sync_results_to_hubspot
+from hubspot_sync import HubSpotError, push_results_to_hubspot
 from models import PipelineJob
 from pipeline import execute_full_pipeline, results_to_csv_bytes
 
@@ -126,7 +126,10 @@ async def export_pipeline_results_csv(job_id: str):
 
 
 @app.post("/pipeline-results/{job_id}/sync-hubspot")
-async def sync_pipeline_results_to_hubspot(job_id: str):
+async def sync_pipeline_results_to_hubspot(job_id: str, dry_run: bool = False):
+    """Pushes a job's results to HubSpot (create-only, see hubspot_sync.py).
+    Safe to re-run - records already in HubSpot are skipped. With
+    ?dry_run=true it only reports what would be created."""
     job = await _get_pipeline_job_or_404(job_id)
     if job.status != "Complete":
         raise HTTPException(status_code=409, detail=f"Job is not complete yet (status: {job.status}).")
@@ -134,9 +137,11 @@ async def sync_pipeline_results_to_hubspot(job_id: str):
         raise HTTPException(status_code=404, detail="Job completed with no results to sync.")
 
     try:
-        return await sync_results_to_hubspot(job.final_combined_results)
+        return await push_results_to_hubspot(job.final_combined_results, dry_run=dry_run)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HubSpotError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 if __name__ == "__main__":

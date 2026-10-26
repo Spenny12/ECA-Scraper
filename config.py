@@ -11,6 +11,12 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY")
 CH_API_KEY = os.environ.get("CH_API_KEY")
 HUBSPOT_ACCESS_TOKEN = os.environ.get("HUBSPOT_ACCESS_TOKEN")
+# Finished jobs are pushed to HubSpot automatically when a token is set;
+# set HUBSPOT_AUTO_PUSH=false to only push via the /sync-hubspot endpoint.
+HUBSPOT_AUTO_PUSH = os.environ.get("HUBSPOT_AUTO_PUSH", "true").lower() != "false"
+# Object type ID of the HubSpot "Project" object (e.g. 2-12345678). Found
+# automatically by its label when unset.
+HUBSPOT_PROJECT_OBJECT = os.environ.get("HUBSPOT_PROJECT_OBJECT")
 FULLENRICH_API_KEY = os.environ.get("FULLENRICH_API_KEY")
 # Private Supabase Storage bucket that finished pipeline jobs are copied to,
 # so they survive Render's free-tier spin-down (which wipes in-memory jobs

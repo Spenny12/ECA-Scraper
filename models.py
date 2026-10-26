@@ -42,4 +42,6 @@ class PipelineJob(BaseModel):
     domains_discovered_count: int = 0
     total_emails_found_count: int = 0
     final_combined_results: List[Dict[str, Any]] = []
+    # What the automatic HubSpot push created/skipped, or {"error": ...}.
+    hubspot_summary: Optional[Dict[str, Any]] = None
 
