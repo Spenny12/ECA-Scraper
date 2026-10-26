@@ -11,7 +11,9 @@ loads what's already there and only creates what's genuinely new:
 - Contacts are matched by email, or by phone for contacts without one. An
   existing contact is left completely untouched (no field updates and no new
   company link), so nobody's contacts get moved or reassigned.
-- Projects are matched by property address and skipped if already there.
+- Projects are matched by property address AND the company they belong to,
+  and skipped if already there. The same address under a different company
+  is a resale - a new purchase and a new lead - so it's still created.
 - Contacts with neither an email nor a phone number are never sent, and a
   company with no such contact is skipped entirely, along with its projects.
 
@@ -102,10 +104,11 @@ class _Client:
             return res.json() if res.content else {}
         raise HubSpotError(f"{method} {path} -> still rate limited after retries")
 
-    async def list_all(self, object_type: str, properties: list) -> list:
+    async def list_all(self, object_type: str, properties: list, associations: str = None) -> list:
         results, after = [], None
         while True:
-            params = {"limit": 100, "properties": ",".join(properties), **({"after": after} if after else {})}
+            params = {"limit": 100, "properties": ",".join(properties), **({"after": after} if after else {}),
+                      **({"associations": associations} if associations else {})}
             data = await self.request("GET", f"/crm/v3/objects/{object_type}", params=params)
             results += data.get("results", [])
             after = data.get("paging", {}).get("next", {}).get("after")
@@ -206,10 +209,11 @@ def _properties(row: dict, mapping: dict) -> dict:
 # ---------------------------------------------------------------- planning
 
 
-def plan_push(results: list, existing_companies: list, existing_emails: set, existing_addresses: set) -> dict:
+def plan_push(results: list, existing_companies: list, existing_emails: set, existing_projects: set) -> dict:
     """Works out what to create, without touching HubSpot. Returns new
     companies, contacts and projects (each linked to a company key that's
-    either an existing HubSpot ID or a new company), plus skip counts."""
+    either an existing HubSpot ID or a new company), plus skip counts.
+    existing_projects holds (normalised address, company ID) pairs."""
     by_name = {}
     for company in existing_companies:
         key = normalise_company(company["properties"].get("name") or "")
@@ -268,7 +272,7 @@ def plan_push(results: list, existing_companies: list, existing_emails: set, exi
             if not address or (key, address) in seen_projects:
                 continue
             seen_projects.add((key, address))
-            if address in existing_addresses:
+            if company_ref[0] == "existing" and (address, company_ref[1]) in existing_projects:
                 plan["skipped"]["projects already in HubSpot"] += 1
                 continue
             plan["projects"].append({"row": row, "company": company_ref})
@@ -363,12 +367,16 @@ async def push_results_to_hubspot(results: list, dry_run: bool = False, token: s
         pipeline_id, stage_id = await _pipeline_stage(hs, project_type)
 
         existing_companies = await hs.list_all("companies", ["name", "domain"])
-        existing_addresses = {_normalise_address(p.get("properties", {}).get(address_prop) or "")
-                              for p in await hs.list_all(project_type, [address_prop])} - {""}
+        existing_projects = set()
+        for project in await hs.list_all(project_type, [address_prop], associations="companies"):
+            address = _normalise_address(project.get("properties", {}).get(address_prop) or "")
+            for link in project.get("associations", {}).get("companies", {}).get("results", []):
+                if address:
+                    existing_projects.add((address, str(link["id"])))
         emails = sorted({_email(r) for r in results} - {""})
         existing_emails = await _existing_emails(hs, emails)
 
-        plan = plan_push(results, existing_companies, existing_emails, existing_addresses)
+        plan = plan_push(results, existing_companies, existing_emails, existing_projects)
 
         # Phone-only contacts can't be matched by email, so check their phone.
         kept = []
