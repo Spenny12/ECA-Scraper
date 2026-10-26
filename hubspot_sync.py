@@ -1,21 +1,20 @@
 """Pushes a completed pipeline job's results into HubSpot as Companies,
 Contacts and Projects (a custom object with its own pipeline).
 
-Create-only: nothing that already exists in HubSpot is ever updated. Each run
-loads what's already there and only creates what's genuinely new:
+Brand-new records only: nothing that already exists in HubSpot is updated
+or added to, so nothing can be merged, renamed or reassigned. Each run loads
+what's already there and only creates companies that are entirely new:
 
-- Companies are matched to existing ones by name (ignoring punctuation and
-  LTD/LIMITED). A matched company is reused as-is - never renamed - so new
-  people at a company the team already owns get linked to it and inherit its
-  owner via HubSpot's owner-assignment workflows.
-- Contacts are matched by email, or by phone for contacts without one. An
-  existing contact is left completely untouched (no field updates and no new
-  company link), so nobody's contacts get moved or reassigned.
-- Projects are matched by property address AND the company they belong to,
-  and skipped if already there. The same address under a different company
-  is a resale - a new purchase and a new lead - so it's still created.
-- Contacts with neither an email nor a phone number are never sent, and a
-  company with no such contact is skipped entirely, along with its projects.
+- A company already in HubSpot - matched by name (ignoring punctuation and
+  LTD/LIMITED) or by its domain - is skipped entirely, with its contacts and
+  projects. It already has an owner, so it's left for them.
+- Contacts are matched by email, or by phone for contacts without one, and
+  any already in HubSpot (e.g. a director of another company) are skipped.
+- Contacts with neither an email nor a phone number are never sent. A company
+  left with no new contact that has one is skipped, with its projects.
+- Each new company gets a project per property address. An address that's
+  already in HubSpot under another company is a resale - a new purchase and
+  a new lead - so it's still created.
 
 Everything a run creates is also added to static HubSpot lists named after
 its job ("ECA-0042 - Contacts", "- Companies", "- Projects"), so each run's
@@ -28,7 +27,9 @@ PROPERTY_LABELS) rather than hard-coded internal names.
 Requires a HubSpot private app ("Development -> Legacy Apps" in HubSpot) with
 scopes crm.objects.{contacts,companies,custom}.{read,write} and
 crm.schemas.{contacts,companies,custom}.read and crm.lists.{read,write},
-its token set as the HUBSPOT_ACCESS_TOKEN environment variable.
+plus the projects object/schema scopes if Projects is HubSpot's built-in
+object (set HUBSPOT_PROJECT_OBJECT=0-970). Its token goes in the
+HUBSPOT_ACCESS_TOKEN environment variable (a Service Key works too).
 """
 import asyncio
 import re
@@ -209,74 +210,66 @@ def _properties(row: dict, mapping: dict) -> dict:
 # ---------------------------------------------------------------- planning
 
 
-def plan_push(results: list, existing_companies: list, existing_emails: set, existing_projects: set) -> dict:
-    """Works out what to create, without touching HubSpot. Returns new
-    companies, contacts and projects (each linked to a company key that's
-    either an existing HubSpot ID or a new company), plus skip counts.
-    existing_projects holds (normalised address, company ID) pairs."""
-    by_name = {}
-    for company in existing_companies:
-        key = normalise_company(company["properties"].get("name") or "")
-        if key:
-            by_name.setdefault(key, []).append(company)
+def plan_push(results: list, existing_companies: list, existing_emails: set) -> dict:
+    """Works out what to create, without touching HubSpot: new companies
+    (keyed by normalised name), their new contacts and projects, plus counts
+    of what was skipped and why."""
+    existing_names = {normalise_company(c["properties"].get("name") or "") for c in existing_companies} - {""}
     used_domains = {(c["properties"].get("domain") or "").lower() for c in existing_companies} - {""}
 
     plan = {"companies": {}, "contacts": [], "projects": [], "skipped": {
-        "contacts without email or phone": 0, "companies without a usable contact": 0,
-        "contacts already in HubSpot": 0, "projects already in HubSpot": 0}}
+        "companies already in HubSpot or sharing a domain": 0, "companies without a usable contact": 0,
+        "contacts without email or phone": 0, "contacts already in HubSpot": 0}}
     rows_by_company = {}
     for row in results:
         key = normalise_company(row.get("Target Company Name", ""))
         if key:
             rows_by_company.setdefault(key, []).append(row)
 
-    seen_emails, seen_people, seen_projects = set(), set(), set()
+    seen_people, seen_projects = set(), set()
     for key, rows in rows_by_company.items():
+        if key in existing_names or any(_domain(r) in used_domains for r in rows if _domain(r)):
+            plan["skipped"]["companies already in HubSpot or sharing a domain"] += 1
+            continue
         usable = [r for r in rows if _email(r) or _phone(r)]
         plan["skipped"]["contacts without email or phone"] += len({_clean(r.get("Employee Name")) for r in rows if r not in usable})
-        if not usable:
-            plan["skipped"]["companies without a usable contact"] += 1
-            continue
 
-        if key in by_name:
-            # Reuse the existing company untouched - prefer one with this domain.
-            domains = {_domain(r) for r in rows}
-            matches = by_name[key]
-            company_ref = ("existing", next((c for c in matches if (c["properties"].get("domain") or "").lower() in domains), matches[0])["id"])
-        else:
-            first = rows[0]
-            new_company = {"row": first, "domain": ""}
-            domain = _domain(first)
-            # A domain already on a differently named company would make
-            # future imports match the wrong record, so it's left off.
-            if domain and domain not in used_domains:
-                new_company["domain"] = domain
-                used_domains.add(domain)
-            plan["companies"][key] = new_company
-            company_ref = ("new", key)
-
+        contacts = []
         for row in usable:
             email = _email(row)
             person = email or (key, _clean(row.get("Employee Name")).upper(), _phone(row))
             if person in seen_people:
-                continue
+                continue                      # same person under another company in this run
             seen_people.add(person)
-            if email and (email in existing_emails or email in seen_emails):
-                plan["skipped"]["contacts already in HubSpot"] += email in existing_emails
+            if email in existing_emails:
+                plan["skipped"]["contacts already in HubSpot"] += 1
                 continue
-            seen_emails.add(email)
-            plan["contacts"].append({"row": row, "company": company_ref})
+            contacts.append({"row": row, "company": key})
+        if not contacts:
+            plan["skipped"]["companies without a usable contact"] += 1
+            continue
 
+        domain = _domain(rows[0])
+        plan["companies"][key] = {"row": rows[0], "domain": domain}
+        if domain:
+            used_domains.add(domain)
+        plan["contacts"] += contacts
         for row in rows:
             address = _normalise_address(row.get("Property Address", ""))
-            if not address or (key, address) in seen_projects:
-                continue
-            seen_projects.add((key, address))
-            if company_ref[0] == "existing" and (address, company_ref[1]) in existing_projects:
-                plan["skipped"]["projects already in HubSpot"] += 1
-                continue
-            plan["projects"].append({"row": row, "company": company_ref})
+            if address and (key, address) not in seen_projects:
+                seen_projects.add((key, address))
+                plan["projects"].append({"row": row, "company": key})
     return plan
+
+
+def _drop_companies_without_contacts(plan: dict):
+    """After phone-only contacts are checked against HubSpot, a company may
+    have no new contact left - it's then skipped like any other."""
+    keep = {c["company"] for c in plan["contacts"]}
+    for key in [k for k in plan["companies"] if k not in keep]:
+        del plan["companies"][key]
+        plan["skipped"]["companies without a usable contact"] += 1
+    plan["projects"] = [p for p in plan["projects"] if p["company"] in keep]
 
 
 # ---------------------------------------------------------------- push
@@ -367,16 +360,10 @@ async def push_results_to_hubspot(results: list, dry_run: bool = False, token: s
         pipeline_id, stage_id = await _pipeline_stage(hs, project_type)
 
         existing_companies = await hs.list_all("companies", ["name", "domain"])
-        existing_projects = set()
-        for project in await hs.list_all(project_type, [address_prop], associations="companies"):
-            address = _normalise_address(project.get("properties", {}).get(address_prop) or "")
-            for link in project.get("associations", {}).get("companies", {}).get("results", []):
-                if address:
-                    existing_projects.add((address, str(link["id"])))
         emails = sorted({_email(r) for r in results} - {""})
         existing_emails = await _existing_emails(hs, emails)
 
-        plan = plan_push(results, existing_companies, existing_emails, existing_projects)
+        plan = plan_push(results, existing_companies, existing_emails)
 
         # Phone-only contacts can't be matched by email, so check their phone.
         kept = []
@@ -387,10 +374,10 @@ async def push_results_to_hubspot(results: list, dry_run: bool = False, token: s
                 continue
             kept.append(contact)
         plan["contacts"] = kept
+        _drop_companies_without_contacts(plan)
 
         summary = {"dry_run": dry_run, "companies created": len(plan["companies"]),
                    "contacts created": len(plan["contacts"]), "projects created": len(plan["projects"]),
-                   "existing companies linked": len({c["company"][1] for c in plan["contacts"] + plan["projects"] if c["company"][0] == "existing"}),
                    **plan["skipped"]}
         if dry_run:
             return summary
@@ -406,7 +393,7 @@ async def push_results_to_hubspot(results: list, dry_run: bool = False, token: s
                     props[domain_prop] = plan["companies"][key]["domain"]
             company_props.append(props)
         new_ids = dict(zip(company_keys, await _batch_create(hs, "companies", company_props)))
-        company_id = lambda ref: ref[1] if ref[0] == "existing" else new_ids.get(ref[1])
+        company_id = new_ids.get
 
         contact_ids = await _batch_create(hs, "contacts", [_properties(c["row"], maps["contacts"]) for c in plan["contacts"]])
         await _associate(hs, "contacts", "companies", [(cid, company_id(c["company"])) for cid, c in zip(contact_ids, plan["contacts"])])
