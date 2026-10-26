@@ -69,7 +69,7 @@ async def execute_full_pipeline(job_id, file_bytes, filename, serper_api_key, ch
             # A HubSpot failure is recorded on the job but doesn't fail it -
             # the results are still saved and exportable either way.
             try:
-                job.hubspot_summary = await hubspot_sync.push_results_to_hubspot(results)
+                job.hubspot_summary = await hubspot_sync.push_results_to_hubspot(results, list_label=job_id)
             except Exception as e:
                 logger.error(f"HubSpot push failed for {job_id}: {e}")
                 job.hubspot_summary = {"error": str(e)}

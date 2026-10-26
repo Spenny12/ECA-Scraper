@@ -9,7 +9,6 @@ config.py for env/limits.
 """
 import asyncio
 import time
-import uuid
 from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
@@ -92,7 +91,7 @@ async def upload_leads_csv_start_pipeline(
     _validate_upload(file, file_bytes)
     max_directors = max_directors_per_company or max_contacts_per_domain or 4
 
-    job_id = f"eca_job_{uuid.uuid4().hex[:8]}"
+    job_id = await asyncio.to_thread(store.next_job_id)
     new_job = PipelineJob(id=job_id, status="Processing", created_at=time.time(), updated_at=time.time())
     store.pipeline_jobs[job_id] = new_job
     store.purge_stale_jobs()
@@ -137,7 +136,7 @@ async def sync_pipeline_results_to_hubspot(job_id: str, dry_run: bool = False):
         raise HTTPException(status_code=404, detail="Job completed with no results to sync.")
 
     try:
-        return await push_results_to_hubspot(job.final_combined_results, dry_run=dry_run)
+        return await push_results_to_hubspot(job.final_combined_results, dry_run=dry_run, list_label=job.id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except HubSpotError as e:

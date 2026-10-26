@@ -8,7 +8,9 @@ get_pipeline_job() transparently reloads a job from there when it's gone.
 Kept in one place so every other module talks to jobs through here rather
 than reaching into globals directly.
 """
+import json
 import re
+import threading
 import time
 from datetime import datetime
 from typing import Dict, Optional
@@ -28,8 +30,45 @@ else:
 
 
 # Job IDs come straight from the URL, so only ever turn ones matching the
-# format main.py generates into a storage path.
-PIPELINE_JOB_ID_RE = re.compile(r'^eca_job_[0-9a-f]{8}$')
+# formats main.py generates (ECA-0042, or older eca_job_3fafe377) into a
+# storage path.
+PIPELINE_JOB_ID_RE = re.compile(r'^(ECA-\d{4,}|eca_job_[0-9a-f]{8})$')
+JOB_NUMBER_RE = re.compile(r'^ECA-(\d+)(\.json)?$')
+COUNTER_PATH = "_job_counter.json"
+_counter_lock = threading.Lock()
+_last_job_number = 0
+
+
+def next_job_id() -> str:
+    """Returns the next sequential job ID (ECA-0001, ECA-0002, ...) - used
+    to tell runs apart in HubSpot, so it must never repeat. The counter is
+    kept in the Supabase bucket so it survives restarts, and is also checked
+    against the highest job already in memory or the bucket in case the
+    counter file is ever lost (blocking - call via asyncio.to_thread)."""
+    global _last_job_number
+    with _counter_lock:
+        highest = max([_last_job_number] + [int(m.group(1)) for j in pipeline_jobs if (m := JOB_NUMBER_RE.match(j))])
+        if supabase:
+            bucket = supabase.storage.from_(SUPABASE_JOBS_BUCKET)
+            try:
+                highest = max(highest, int(json.loads(bucket.download(COUNTER_PATH))["last"]))
+            except Exception:
+                pass  # no counter yet - fall back to the jobs in the bucket
+            try:
+                highest = max([highest] + [int(m.group(1)) for item in bucket.list(options={"limit": 1000})
+                                           if (m := JOB_NUMBER_RE.match(item.get("name", "")))])
+            except Exception as e:
+                logger.warning(f"Couldn't list Supabase jobs while numbering a new job: {e}")
+        _last_job_number = highest + 1
+        if supabase:
+            try:
+                supabase.storage.from_(SUPABASE_JOBS_BUCKET).upload(
+                    COUNTER_PATH, json.dumps({"last": _last_job_number}).encode("utf-8"),
+                    file_options={"content-type": "application/json", "upsert": "true"},
+                )
+            except Exception as e:
+                logger.error(f"Failed to save the job counter to Supabase Storage: {e}")
+        return f"ECA-{_last_job_number:04d}"
 
 
 def _job_path(job_id: str) -> str:
@@ -98,7 +137,8 @@ def purge_persisted_jobs():
         stale = []
         for item in bucket.list(options={"limit": 1000}):
             created = item.get("created_at")
-            if not created:
+            # Only job files expire - the job counter must never be purged.
+            if not created or not PIPELINE_JOB_ID_RE.match(item.get("name", "").removesuffix(".json")):
                 continue
             created_ts = datetime.fromisoformat(created.replace("Z", "+00:00")).timestamp()
             if created_ts < cutoff:

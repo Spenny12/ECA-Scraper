@@ -15,18 +15,23 @@ loads what's already there and only creates what's genuinely new:
 - Contacts with neither an email nor a phone number are never sent, and a
   company with no such contact is skipped entirely, along with its projects.
 
+Everything a run creates is also added to static HubSpot lists named after
+its job ("ECA-0042 - Contacts", "- Companies", "- Projects"), so each run's
+records can be found in HubSpot without adding a property for it.
+
 The team can't create HubSpot properties, so this only writes to properties
 that already exist. They're found by their labels in HubSpot at runtime (see
 PROPERTY_LABELS) rather than hard-coded internal names.
 
 Requires a HubSpot private app ("Development -> Legacy Apps" in HubSpot) with
 scopes crm.objects.{contacts,companies,custom}.{read,write} and
-crm.schemas.{contacts,companies,custom}.read, its token set as the
-HUBSPOT_ACCESS_TOKEN environment variable.
+crm.schemas.{contacts,companies,custom}.read and crm.lists.{read,write},
+its token set as the HUBSPOT_ACCESS_TOKEN environment variable.
 """
 import asyncio
 import re
 import time
+from urllib.parse import quote
 
 import httpx
 
@@ -79,7 +84,7 @@ class _Client:
         self.headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         self.last = {"default": 0.0, "search": 0.0}
 
-    async def request(self, method: str, path: str, json=None, params=None, kind: str = "default"):
+    async def request(self, method: str, path: str, json=None, params=None, kind: str = "default", allow_404: bool = False):
         interval = SEARCH_INTERVAL if kind == "search" else REQUEST_INTERVAL
         for attempt in range(5):
             wait = self.last[kind] + interval - time.monotonic()
@@ -90,6 +95,8 @@ class _Client:
             if res.status_code == 429:
                 await asyncio.sleep(float(res.headers.get("Retry-After", 10)))
                 continue
+            if res.status_code == 404 and allow_404:
+                return None
             if res.status_code >= 400:
                 raise HubSpotError(f"{method} {path} -> HTTP {res.status_code}: {res.text[:300]}")
             return res.json() if res.content else {}
@@ -301,6 +308,22 @@ async def _associate(hs: _Client, from_type: str, to_type: str, pairs: list):
                          json={"inputs": [{"from": {"id": a}, "to": {"id": b}} for a, b in chunk]})
 
 
+async def _add_to_list(hs: _Client, name: str, object_type_id: str, record_ids: list):
+    """Adds records to the static list with this name, creating it if
+    needed (so re-running a push adds to the same list)."""
+    record_ids = [r for r in record_ids if r]
+    if not record_ids:
+        return
+    found = await hs.request("GET", f"/crm/v3/lists/object-type-id/{object_type_id}/name/{quote(name, safe='')}", allow_404=True)
+    if found:
+        list_id = found["list"]["listId"]
+    else:
+        created = await hs.request("POST", "/crm/v3/lists", json={"name": name, "objectTypeId": object_type_id, "processingType": "MANUAL"})
+        list_id = created["list"]["listId"]
+    for i in range(0, len(record_ids), BATCH_SIZE):
+        await hs.request("PUT", f"/crm/v3/lists/{list_id}/memberships/add", json=record_ids[i:i + BATCH_SIZE])
+
+
 async def _existing_emails(hs: _Client, emails: list) -> set:
     found = set()
     for i in range(0, len(emails), BATCH_SIZE):
@@ -318,9 +341,10 @@ async def _phone_exists(hs: _Client, phone: str) -> bool:
 
 
 async def push_results_to_hubspot(results: list, dry_run: bool = False, token: str = None,
-                                  client: httpx.AsyncClient = None) -> dict:
+                                  client: httpx.AsyncClient = None, list_label: str = None) -> dict:
     """Creates the new companies, contacts and projects from a job's
-    results. With dry_run, works out and returns the same summary without
+    results, adding them to lists named after list_label (the job ID) when
+    given. With dry_run, works out and returns the same summary without
     creating anything."""
     token = token or HUBSPOT_ACCESS_TOKEN
     if not token:
@@ -386,6 +410,19 @@ async def push_results_to_hubspot(results: list, dry_run: bool = False, token: s
             project_props.append(props)
         project_ids = await _batch_create(hs, project_type, project_props)
         await _associate(hs, project_type, "companies", [(pid, company_id(p["company"])) for pid, p in zip(project_ids, plan["projects"])])
+
+        if list_label:
+            # Lists are a convenience - a failure here doesn't undo the push.
+            lists = {f"{list_label} - Companies": ("0-2", list(new_ids.values())),
+                     f"{list_label} - Contacts": ("0-1", contact_ids),
+                     f"{list_label} - Projects": (project_type, project_ids)}
+            try:
+                for name, (object_type_id, ids) in lists.items():
+                    await _add_to_list(hs, name, object_type_id, ids)
+                summary["lists"] = [name for name, (_, ids) in lists.items() if any(ids)]
+            except HubSpotError as e:
+                logger.warning(f"HubSpot push done, but adding records to lists failed: {e}")
+                summary["lists"] = f"failed: {e}"
 
         logger.info(f"HubSpot push complete: {summary}")
         return summary
