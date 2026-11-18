@@ -5,15 +5,37 @@ import os
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] - %(message)s")
 logger = logging.getLogger("ECA_Pipeline")
 
+
+def _load_env_file(path):
+    """Loads KEY=value lines from a local .env file (for runs on your own PC).
+    Variables already set in the environment win; Render has no .env file."""
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8-sig") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            value = value.strip().strip('"').strip("'")
+            if value:
+                os.environ.setdefault(key.strip(), value)
+
+
+_load_env_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
 # --- API keys / credentials (set on Render as environment variables) ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY")
 CH_API_KEY = os.environ.get("CH_API_KEY")
+# The website takes the Hunter key from the upload form; local runs read it here.
+HUNTER_API_KEY = os.environ.get("HUNTER_API_KEY")
 HUBSPOT_ACCESS_TOKEN = os.environ.get("HUBSPOT_ACCESS_TOKEN")
-# Finished jobs are pushed to HubSpot automatically when a token is set;
-# set HUBSPOT_AUTO_PUSH=false to only push via the /sync-hubspot endpoint.
-HUBSPOT_AUTO_PUSH = os.environ.get("HUBSPOT_AUTO_PUSH", "true").lower() != "false"
+# Off by default: finished jobs are only pushed to HubSpot via the
+# /sync-hubspot endpoint. Set HUBSPOT_AUTO_PUSH=true to push every job
+# automatically when it finishes.
+HUBSPOT_AUTO_PUSH = os.environ.get("HUBSPOT_AUTO_PUSH", "false").lower() == "true"
 # Object type ID of the HubSpot "Project" object (e.g. 2-12345678). Found
 # automatically by its label when unset.
 HUBSPOT_PROJECT_OBJECT = os.environ.get("HUBSPOT_PROJECT_OBJECT")

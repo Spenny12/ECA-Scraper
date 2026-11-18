@@ -1,0 +1,10 @@
+# Local secrets (the frontend has its own .gitignore)
+/.env
+/.env.*
+!/.env.example
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
