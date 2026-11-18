@@ -8,3 +8,6 @@ __pycache__/
 *.pyc
 venv/
 .venv/
+
+# Local pipeline runs (contain personal data)
+/runs/
